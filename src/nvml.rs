@@ -1,9 +1,10 @@
-use crate::model::{GpuSnapshot, ProcessKind, ProcessSnapshot, Snapshot};
-use crate::procfs::Procfs;
-use std::collections::BTreeMap;
+use crate::model::{DrmStatus, GpuSnapshot, ProcessKind, ProcessSnapshot, Snapshot, VramHolderSnapshot};
+use crate::procfs::{normalize_pci_bus_id, Procfs, UvmProbe};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::mem;
 use std::ptr;
+use std::time::{Duration, Instant};
 
 const NVML_SUCCESS: i32 = 0;
 const NVML_ERROR_NOT_SUPPORTED: i32 = 3;
@@ -65,6 +66,37 @@ struct NvmlMemory {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+struct NvmlMemoryV2 {
+    version: u32,
+    total: u64,
+    reserved: u64,
+    free: u64,
+    used: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NvmlPciInfo {
+    bus_id_legacy: [c_char; 16],
+    domain: u32,
+    bus: u32,
+    device: u32,
+    pci_device_id: u32,
+    pci_subsystem_id: u32,
+    bus_id: [c_char; 32],
+}
+
+impl Default for NvmlPciInfo {
+    fn default() -> Self {
+        Self {
+            bus_id_legacy: [0; 16], domain: 0, bus: 0, device: 0,
+            pci_device_id: 0, pci_subsystem_id: 0, bus_id: [0; 32],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct NvmlProcessInfo {
     pid: u32,
     used_gpu_memory: u64,
@@ -90,6 +122,8 @@ type GetHandleByIndexFn = unsafe extern "C" fn(u32, *mut NvmlDevice) -> NvmlRetu
 type GetNameFn = unsafe extern "C" fn(NvmlDevice, *mut c_char, u32) -> NvmlReturn;
 type GetUtilizationFn = unsafe extern "C" fn(NvmlDevice, *mut NvmlUtilization) -> NvmlReturn;
 type GetMemoryFn = unsafe extern "C" fn(NvmlDevice, *mut NvmlMemory) -> NvmlReturn;
+type GetMemoryV2Fn = unsafe extern "C" fn(NvmlDevice, *mut NvmlMemoryV2) -> NvmlReturn;
+type GetPciInfoFn = unsafe extern "C" fn(NvmlDevice, *mut NvmlPciInfo) -> NvmlReturn;
 type GetTemperatureFn = unsafe extern "C" fn(NvmlDevice, u32, *mut u32) -> NvmlReturn;
 type GetU32Fn = unsafe extern "C" fn(NvmlDevice, *mut u32) -> NvmlReturn;
 type GetU64Fn = unsafe extern "C" fn(NvmlDevice, *mut u64) -> NvmlReturn;
@@ -197,6 +231,8 @@ struct NvmlApi {
     get_name: GetNameFn,
     get_utilization: GetUtilizationFn,
     get_memory: GetMemoryFn,
+    get_memory_v2: Option<GetMemoryV2Fn>,
+    get_pci_info: Option<GetPciInfoFn>,
     get_temperature: Option<GetTemperatureFn>,
     get_power: Option<GetU32Fn>,
     get_power_limit: Option<GetU32Fn>,
@@ -260,6 +296,8 @@ impl NvmlApi {
             get_name: required_symbol!(library, "nvmlDeviceGetName", GetNameFn),
             get_utilization: required_symbol!(library, "nvmlDeviceGetUtilizationRates", GetUtilizationFn),
             get_memory: required_symbol!(library, "nvmlDeviceGetMemoryInfo", GetMemoryFn),
+            get_memory_v2: optional_symbol!(library, "nvmlDeviceGetMemoryInfo_v2", GetMemoryV2Fn),
+            get_pci_info: load_pci_info_symbol(&library),
             get_temperature: optional_symbol!(library, "nvmlDeviceGetTemperature", GetTemperatureFn),
             get_power: optional_symbol!(library, "nvmlDeviceGetPowerUsage", GetU32Fn),
             get_power_limit: optional_symbol!(library, "nvmlDeviceGetPowerManagementLimit", GetU32Fn),
@@ -333,6 +371,16 @@ impl NvmlApi {
     }
 }
 
+
+fn load_pci_info_symbol(library: &DynamicLibrary) -> Option<GetPciInfoFn> {
+    for name in ["nvmlDeviceGetPciInfo_v3", "nvmlDeviceGetPciInfo_v2", "nvmlDeviceGetPciInfo"] {
+        if let Some(pointer) = library.symbol_optional(name) {
+            return Some(unsafe { mem::transmute::<*mut c_void, GetPciInfoFn>(pointer) });
+        }
+    }
+    None
+}
+
 fn load_clock_event_reasons_symbol(library: &DynamicLibrary) -> Option<GetU64Fn> {
     for name in [
         "nvmlDeviceGetCurrentClocksEventReasons",
@@ -362,6 +410,8 @@ pub struct NvmlCollector {
     devices: Vec<NvmlDevice>,
     procfs: Procfs,
     process_last_seen: Vec<u64>,
+    uvm_probe: UvmProbe,
+    uvm_last_scan: Option<Instant>,
 }
 
 impl NvmlCollector {
@@ -398,6 +448,8 @@ impl NvmlCollector {
             devices,
             procfs: Procfs::new(),
             process_last_seen,
+            uvm_probe: UvmProbe::default(),
+            uvm_last_scan: None,
         })
     }
 
@@ -406,10 +458,17 @@ impl NvmlCollector {
 
         for index in 0..self.devices.len() {
             let device = self.devices[index];
-            snapshot.gpus.push(self.collect_gpu(index as u32, device));
-            snapshot
-                .processes
-                .extend(self.collect_processes(index as u32, device));
+            let pci_bus_id = query_pci_bus_id(self.api.get_pci_info, device);
+            let (processes, drm_resident, drm_clients, drm_status, drm_partial) =
+                self.collect_processes(index as u32, device, pci_bus_id.as_deref());
+            let process_memory = processes
+                .iter()
+                .filter_map(|process| process.memory_bytes)
+                .fold(0u64, u64::saturating_add);
+            snapshot.gpus.push(self.collect_gpu(
+                index as u32, device, pci_bus_id, process_memory, drm_resident, drm_clients, drm_status, drm_partial,
+            ));
+            snapshot.processes.extend(processes);
         }
 
         snapshot.processes.sort_by(|a, b| {
@@ -419,10 +478,74 @@ impl NvmlCollector {
                 .then_with(|| b.memory_bytes.unwrap_or(0).cmp(&a.memory_bytes.unwrap_or(0)))
                 .then_with(|| a.pid.cmp(&b.pid))
         });
+
+        // /dev/nvidia-uvm ownership is an independent signal from NVML's
+        // per-process framebuffer accounting. Some CUDA/TTS/browser processes
+        // keep a UVM context open while NVML attributes little or no VRAM to
+        // them. Refresh this more expensive /proc scan at a lower cadence.
+        let refresh_uvm = self
+            .uvm_last_scan
+            .map(|last| last.elapsed() >= Duration::from_secs(2))
+            .unwrap_or(true);
+        if refresh_uvm {
+            self.uvm_probe = self.procfs.uvm_holders();
+            self.uvm_last_scan = Some(Instant::now());
+        }
+
+        let mut nvml_by_pid: BTreeMap<u32, (Option<u64>, BTreeSet<u32>)> = BTreeMap::new();
+        for process in &snapshot.processes {
+            let entry = nvml_by_pid
+                .entry(process.pid)
+                .or_insert_with(|| (None, BTreeSet::new()));
+            if let Some(bytes) = process.memory_bytes {
+                entry.0 = Some(entry.0.unwrap_or(0).saturating_add(bytes));
+            }
+            entry.1.insert(process.gpu_index);
+        }
+
+        snapshot.vram_holders = self
+            .uvm_probe
+            .pids
+            .iter()
+            .copied()
+            .map(|pid| {
+                let (user, name) = self.procfs.metadata(pid);
+                let (memory, gpus) = nvml_by_pid
+                    .get(&pid)
+                    .map(|(memory, gpus)| {
+                        (*memory, gpus.iter().copied().collect())
+                    })
+                    .unwrap_or((None, Vec::new()));
+                VramHolderSnapshot {
+                    pid,
+                    name,
+                    user,
+                    nvml_memory_bytes: memory,
+                    gpu_indices: gpus,
+                }
+            })
+            .collect();
+        snapshot.vram_holders.sort_by(|a, b| {
+            // Holders with no/zero NVML-attributed VRAM are the most useful
+            // suspects for an unexplained gap, so keep them visible first.
+            let a_hidden = a.nvml_memory_bytes.unwrap_or(0) == 0;
+            let b_hidden = b.nvml_memory_bytes.unwrap_or(0) == 0;
+            b_hidden
+                .cmp(&a_hidden)
+                .then_with(|| {
+                    b.nvml_memory_bytes
+                        .unwrap_or(0)
+                        .cmp(&a.nvml_memory_bytes.unwrap_or(0))
+                })
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
+        snapshot.uvm_module_refcount = self.uvm_probe.module_refcount;
+        snapshot.uvm_scan_partial = self.uvm_probe.permission_denied;
+
         snapshot
     }
 
-    fn collect_gpu(&self, index: u32, device: NvmlDevice) -> GpuSnapshot {
+    fn collect_gpu(&self, index: u32, device: NvmlDevice, pci_bus_id: Option<String>, process_memory: u64, drm_resident: Option<u64>, drm_clients: usize, drm_status: DrmStatus, drm_partial: bool) -> GpuSnapshot {
         let mut name_buffer = [0 as c_char; 256];
         let name = if unsafe {
             (self.api.get_name)(device, name_buffer.as_mut_ptr(), name_buffer.len() as u32)
@@ -442,17 +565,27 @@ impl NvmlCollector {
             0
         };
 
-        let mut memory = NvmlMemory::default();
-        if unsafe { (self.api.get_memory)(device, &mut memory) } != NVML_SUCCESS {
-            memory = NvmlMemory::default();
-        }
+        let (memory_total, memory_used, memory_reserved) = query_memory(
+            self.api.get_memory_v2, self.api.get_memory, device,
+        );
+        let memory_other = memory_reserved.map(|_| {
+            residual_vram(memory_used, process_memory)
+        });
 
         GpuSnapshot {
             index,
             name,
             gpu_util,
-            memory_total: memory.total,
-            memory_used: memory.used,
+            memory_total,
+            memory_used,
+            memory_reserved,
+            memory_processes: process_memory,
+            memory_other,
+            drm_resident,
+            drm_clients,
+            drm_status,
+            drm_partial,
+            pci_bus_id,
             temperature_c: query_temperature(self.api.get_temperature, device),
             temperature_slowdown_c: query_temperature_threshold(
                 self.api.get_temperature_threshold,
@@ -494,7 +627,7 @@ impl NvmlCollector {
         }
     }
 
-    fn collect_processes(&mut self, gpu_index: u32, device: NvmlDevice) -> Vec<ProcessSnapshot> {
+    fn collect_processes(&mut self, gpu_index: u32, device: NvmlDevice, pci_bus_id: Option<&str>) -> (Vec<ProcessSnapshot>, Option<u64>, usize, DrmStatus, bool) {
         let mut rows: BTreeMap<u32, ProcessGpuRow> = BTreeMap::new();
 
         if let Some(function) = self.api.get_compute_processes {
@@ -524,20 +657,45 @@ impl NvmlCollector {
             None
         };
 
-        rows.into_iter()
-            .map(|(pid, row)| {
-                let (user, name) = self.procfs.metadata(pid);
-                ProcessSnapshot {
-                    gpu_index,
-                    pid,
-                    name,
-                    user,
-                    kind: row.kind,
-                    gpu_util: utilization.as_ref().map(|values| *values.get(&pid).unwrap_or(&0)),
-                    memory_bytes: row.memory,
+        let mut seen_drm_clients = BTreeSet::new();
+        let mut matched_drm_clients = BTreeSet::new();
+        let mut drm_total = 0u64;
+        let mut drm_available = false;
+        let mut drm_partial = false;
+        let mut output = Vec::with_capacity(rows.len());
+        for (pid, row) in rows {
+            let (user, name) = self.procfs.metadata(pid);
+            let drm_probe = pci_bus_id
+                .map(|bdf| self.procfs.drm_clients(pid, bdf))
+                .unwrap_or_default();
+            drm_partial |= drm_probe.permission_denied;
+            matched_drm_clients.extend(drm_probe.matched_client_ids.iter().copied());
+            let drm_resident_bytes = if drm_probe.clients.is_empty() {
+                None
+            } else {
+                drm_available = true;
+                Some(drm_probe.clients.iter().map(|client| client.resident_device_bytes).fold(0u64, u64::saturating_add))
+            };
+            for client in drm_probe.clients {
+                if seen_drm_clients.insert(client.client_id) {
+                    drm_total = drm_total.saturating_add(client.resident_device_bytes);
                 }
-            })
-            .collect()
+            }
+            output.push(ProcessSnapshot {
+                gpu_index, pid, name, user, kind: row.kind,
+                gpu_util: utilization.as_ref().map(|values| *values.get(&pid).unwrap_or(&0)),
+                memory_bytes: row.memory,
+                drm_resident_bytes,
+            });
+        }
+
+        let drm_status = classify_drm_status(
+            drm_available,
+            !matched_drm_clients.is_empty(),
+            drm_partial,
+        );
+        let drm_resident = drm_available.then_some(drm_total);
+        (output, drm_resident, seen_drm_clients.len(), drm_status, drm_partial)
     }
 }
 
@@ -572,6 +730,85 @@ fn merge_process(
             };
         })
         .or_insert(ProcessGpuRow { kind, memory });
+}
+
+fn residual_vram(allocated: u64, processes: u64) -> u64 {
+    allocated.saturating_sub(processes)
+}
+
+fn classify_drm_status(memory_available: bool, matching_clients: bool, permission_denied: bool) -> DrmStatus {
+    if memory_available {
+        DrmStatus::Available
+    } else if matching_clients {
+        // Generic DRM fdinfo identification is present, but this driver did
+        // not export any drm-resident-* / drm-memory-* VRAM counters.
+        DrmStatus::Unsupported
+    } else if permission_denied {
+        DrmStatus::PermissionDenied
+    } else {
+        DrmStatus::Unavailable
+    }
+}
+
+
+/// Normalize the two NVML memory-v2 behaviours seen in released drivers.
+///
+/// NVIDIA's documentation says `used` includes `reserved`, but released NVML
+/// implementations have also returned the reserved framebuffer as a separate
+/// bucket (`total == free + used + reserved`).  Detect the actual ABI semantics
+/// from the accounting identity instead of assuming either interpretation.
+/// The returned `allocated` value always means non-reserved, actively allocated
+/// framebuffer memory, so the UI remains consistent across driver versions.
+fn normalize_memory_v2(memory: NvmlMemoryV2) -> (u64, u64, u64) {
+    let separate_sum = memory
+        .free
+        .saturating_add(memory.used)
+        .saturating_add(memory.reserved);
+    let included_sum = memory.free.saturating_add(memory.used);
+    let separate_error = memory.total.abs_diff(separate_sum);
+    let included_error = memory.total.abs_diff(included_sum);
+
+    let allocated = if included_error < separate_error {
+        // `used` includes reserved: strip it to get process/other allocations.
+        memory.used.saturating_sub(memory.reserved)
+    } else {
+        // `used` and `reserved` are already disjoint (common released-driver
+        // behaviour and what nvidia-smi reports as Used + Reserved).
+        memory.used
+    };
+
+    (memory.total, allocated, memory.reserved)
+}
+
+fn query_memory(v2: Option<GetMemoryV2Fn>, v1: GetMemoryFn, device: NvmlDevice) -> (u64, u64, Option<u64>) {
+    if let Some(function) = v2 {
+        let mut memory = NvmlMemoryV2::default();
+        memory.version = (mem::size_of::<NvmlMemoryV2>() as u32) | (2u32 << 24);
+        if unsafe { function(device, &mut memory) } == NVML_SUCCESS {
+            let (total, allocated, reserved) = normalize_memory_v2(memory);
+            return (total, allocated, Some(reserved));
+        }
+    }
+    let mut memory = NvmlMemory::default();
+    if unsafe { v1(device, &mut memory) } == NVML_SUCCESS {
+        (memory.total, memory.used, None)
+    } else {
+        (0, 0, None)
+    }
+}
+
+fn query_pci_bus_id(function: Option<GetPciInfoFn>, device: NvmlDevice) -> Option<String> {
+    let function = function?;
+    let mut info = NvmlPciInfo::default();
+    if unsafe { function(device, &mut info) } != NVML_SUCCESS {
+        return None;
+    }
+    let raw = unsafe { CStr::from_ptr(info.bus_id.as_ptr()) }.to_string_lossy();
+    if raw.is_empty() {
+        None
+    } else {
+        Some(normalize_pci_bus_id(&raw))
+    }
 }
 
 fn query_u32(function: Option<GetU32Fn>, device: NvmlDevice) -> Option<u32> {
@@ -802,17 +1039,58 @@ fn memory_value(value: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_clock_limit, NvmlMemory, NvmlProcessInfo, NvmlProcessUtilizationSample, NvmlUtilization, NVML_CLOCK_EVENT_REASON_GPU_IDLE, NVML_CLOCK_EVENT_REASON_HW_THERMAL, NVML_CLOCK_EVENT_REASON_SW_POWER_CAP};
+    use super::{DrmStatus, format_clock_limit, classify_drm_status, normalize_memory_v2, residual_vram, NvmlMemory, NvmlMemoryV2, NvmlPciInfo, NvmlProcessInfo, NvmlProcessUtilizationSample, NvmlUtilization, NVML_CLOCK_EVENT_REASON_GPU_IDLE, NVML_CLOCK_EVENT_REASON_HW_THERMAL, NVML_CLOCK_EVENT_REASON_SW_POWER_CAP};
     use std::mem::{align_of, size_of};
 
     #[test]
     fn nvml_ffi_layout_sizes_match_linux_c_abi() {
         assert_eq!(size_of::<NvmlUtilization>(), 8);
         assert_eq!(size_of::<NvmlMemory>(), 24);
+        assert_eq!(size_of::<NvmlMemoryV2>(), 40);
+        assert_eq!(size_of::<NvmlPciInfo>(), 68);
         assert_eq!(size_of::<NvmlProcessInfo>(), 24);
         assert_eq!(size_of::<NvmlProcessUtilizationSample>(), 32);
         assert_eq!(align_of::<NvmlProcessInfo>(), 8);
         assert_eq!(align_of::<NvmlProcessUtilizationSample>(), 8);
+    }
+
+
+    #[test]
+    fn residual_vram_is_allocated_minus_processes() {
+        assert_eq!(residual_vram(345, 318), 27);
+        assert_eq!(residual_vram(100, 120), 0);
+    }
+
+    #[test]
+    fn memory_v2_normalizes_drivers_where_reserved_is_separate() {
+        // Matches released-driver behaviour reported by nvidia-smi/NVML:
+        // total = free + used + reserved.
+        let mib = 1024u64 * 1024;
+        let memory = NvmlMemoryV2 {
+            version: 0,
+            total: 6144 * mib,
+            reserved: 419 * mib,
+            free: 5380 * mib,
+            used: 345 * mib,
+        };
+        let (_, allocated, reserved) = normalize_memory_v2(memory);
+        assert_eq!(allocated, 345 * mib);
+        assert_eq!(reserved, 419 * mib);
+    }
+
+    #[test]
+    fn memory_v2_normalizes_drivers_where_used_includes_reserved() {
+        let mib = 1024u64 * 1024;
+        let memory = NvmlMemoryV2 {
+            version: 0,
+            total: 6144 * mib,
+            reserved: 419 * mib,
+            free: 5380 * mib,
+            used: 764 * mib,
+        };
+        let (_, allocated, reserved) = normalize_memory_v2(memory);
+        assert_eq!(allocated, 345 * mib);
+        assert_eq!(reserved, 419 * mib);
     }
 
     #[test]
@@ -828,4 +1106,14 @@ mod tests {
             "power+hw thermal"
         );
     }
+    #[test]
+    fn classifies_drm_fdinfo_states_without_ambiguous_dash() {
+        assert_eq!(classify_drm_status(true, true, false), DrmStatus::Available);
+        assert_eq!(classify_drm_status(false, true, false), DrmStatus::Unsupported);
+        assert_eq!(classify_drm_status(false, false, true), DrmStatus::PermissionDenied);
+        assert_eq!(classify_drm_status(false, false, false), DrmStatus::Unavailable);
+        // Usable counters win even when some other fdinfo entries were denied.
+        assert_eq!(classify_drm_status(true, true, true), DrmStatus::Available);
+    }
+
 }

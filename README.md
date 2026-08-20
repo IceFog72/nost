@@ -28,7 +28,7 @@ For the real monitor:
 ## What it reads directly from NVML
 
 - GPU utilization
-- framebuffer/VRAM total + used
+- framebuffer/VRAM total + used + explicit system-reserved bytes through `nvmlDeviceGetMemoryInfo_v2` when available
 - GPU temperature plus supported slowdown / maximum-operating / shutdown thresholds
 - power draw + power limit
 - fan speed
@@ -43,6 +43,7 @@ For the real monitor:
 
 Process user/name metadata comes from Linux `/proc` and `/etc/passwd`, not from `nvidia-smi`.
 
+
 Unsupported optional metrics display as `--` instead of failing the monitor.
 
 ## UI / color grading
@@ -50,16 +51,14 @@ Unsupported optional metrics display as `--` instead of failing the monitor.
 The renderer is intentionally small and dependency-free, but the visual hierarchy is now closer to btop:
 
 - bordered GPU and process panels
-- GPU and VRAM history graphs; they automatically grow from one to two terminal rows when the window is tall enough
+- GPU and VRAM multi-row history graphs
 - long utilization bars rather than diagnostic-sized meters
-- local clock in the header
-- compact three-column telemetry rows without repeating the current temperature or VRAM values already shown beside the main bars
-- btop-style vertical graph grading: lower graph levels are cool/green, then yellow/amber, with orange/coral at the top of tall samples
-- a separate cyan/teal VRAM grade that also turns amber/red near saturation
+- three-column thermals/power/fan and clocks/VRAM rows
+- btop-style **row-based** history color grading: bottom rows stay cool/green, middle rows yellow/amber, and upper rows orange/red; the color does not change from time-column to time-column
+- the VRAM graph uses the same row-based geometry with its cyan/teal → yellow → orange/red palette
 - temperature is graded against NVML-reported hardware limits when the GPU exposes them, instead of fixed generic thresholds
 - temperature, power and per-process GPU percentages use the same severity grades
 - compact `limit`, `ENC`/`DEC`, hardware thermal-limit, PCIe link and PCIe TX/RX rows
-- human-readable PCIe traffic scaling such as `TX 1.0 MB/s  RX 732 KB/s` instead of a cramped unparsed counter
 - 24-bit color when the terminal advertises truecolor, with an automatic ANSI-256 fallback
 
 No TUI framework is required: the app still writes a single ANSI frame directly and never registers keyboard or mouse input.
@@ -107,7 +106,7 @@ NVIDIA driver
        ├── running processes
        └── process utilization
              │
-        /proc metadata
+        /proc metadata + DRM fdinfo
              │
              ▼
       snapshot + history
@@ -117,3 +116,38 @@ NVIDIA driver
 ```
 
 The Rust project has **zero Cargo dependencies**. NVML is loaded with `dlopen()` at runtime, so the project can be built even on a machine without NVIDIA hardware/driver installed; use `./run-demo.sh` there.
+
+
+## v0.4.2 UI cleanup
+
+- Removed the global `nost / nvidia / clock / NVML / interval / GPU count` header row.
+- Removed blank rows between the GPU and process panels.
+- Video telemetry is rendered as parsed fields: `video  ENC 0%  DEC 0%`.
+- PCIe traffic is rendered as parsed fields with readable units: `traffic  TX 1 MB/s  RX 585 KB/s`.
+
+## Internal VRAM accounting
+
+nost still normalizes NVML memory-v2 accounting internally and can use DRM `fdinfo` as a cross-check, but `proc`, `reserved`, and `drm` are intentionally not rendered in the main GPU panel. Per-process VRAM stays in the process table; the third `vram holders` panel is focused specifically on finding UVM/CUDA owners that may be absent from NVML's attributable VRAM rows.
+
+## v0.4.7 VRAM holders panel
+
+A third panel now cross-checks unexplained framebuffer usage against processes that keep `/dev/nvidia-uvm` open:
+
+```text
+╭─ vram holders  2 UVM ───────────────────────────────╮
+│ unattributed 445 MiB   UVM module refs 4   scan ... │
+│ PID       USER         GPU      PROCESS    NVML VRAM │
+│ 1745052   icefog       --       Discord           -- │
+│ 1884401   icefog       --       python3 pocket... -- │
+╰─────────────────────────────────────────────────────╯
+```
+
+The panel uses two independent signals:
+
+1. **NVML gap analysis**: active framebuffer usage minus the sum of NVML-attributed process VRAM gives an `unattributed` residual. This residual is diagnostic; it is not assumed to belong to UVM.
+2. **UVM ownership scan**: every two seconds nost walks `/proc/<pid>/fd` and finds processes whose file descriptors point to `/dev/nvidia-uvm`, equivalent to the useful part of `lsof | grep nvidia-uvm` but without spawning `lsof`. It also reads `/sys/module/nvidia_uvm/refcnt` when available.
+
+A UVM holder with `NVML VRAM --` is particularly useful: it means the process has an active UVM/CUDA ownership signal even though NVML's per-process framebuffer table does not currently attribute bytes to it. The panel does **not** claim that every UVM holder owns the entire unattributed gap.
+
+If `/proc/<pid>/fd` is hidden by permissions, the summary says `scan partial`; visible holders remain useful but the list is not exhaustive.
+

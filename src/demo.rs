@@ -1,4 +1,4 @@
-use crate::model::{GpuSnapshot, ProcessKind, ProcessSnapshot, Snapshot};
+use crate::model::{DrmStatus, GpuSnapshot, ProcessKind, ProcessSnapshot, Snapshot, VramHolderSnapshot};
 use std::time::Instant;
 
 pub struct DemoCollector {
@@ -21,7 +21,7 @@ impl DemoCollector {
         };
 
         let gpu_util = wave(62.0, 24.0, 0.72, 0.0);
-        let memory_used = ((2.6 + 0.35 * (t * 0.23).sin()) * 1024.0 * 1024.0 * 1024.0) as u64;
+        let memory_used = ((3.6 + 0.35 * (t * 0.23).sin()) * 1024.0 * 1024.0 * 1024.0) as u64;
         let total = 6 * 1024 * 1024 * 1024u64;
 
         let gpus = vec![GpuSnapshot {
@@ -30,6 +30,14 @@ impl DemoCollector {
             gpu_util,
             memory_total: total,
             memory_used,
+            memory_reserved: Some(64 * 1024 * 1024),
+            memory_processes: 2782 * 1024 * 1024,
+            memory_other: Some(memory_used.saturating_sub(64 * 1024 * 1024).saturating_sub(2782 * 1024 * 1024)),
+            drm_resident: Some(2510 * 1024 * 1024),
+            drm_clients: 4,
+            drm_status: DrmStatus::Available,
+            drm_partial: false,
+            pci_bus_id: Some("0000:01:00.0".to_string()),
             temperature_c: Some((55.0 + 7.0 * (t * 0.31).sin()).round() as u32),
             temperature_slowdown_c: Some(87),
             temperature_shutdown_c: Some(97),
@@ -59,6 +67,7 @@ impl DemoCollector {
                 kind: ProcessKind::Compute,
                 gpu_util: Some(wave(46.0, 18.0, 0.81, 0.3)),
                 memory_bytes: Some(1720 * 1024 * 1024),
+                drm_resident_bytes: Some(1600 * 1024 * 1024),
             },
             ProcessSnapshot {
                 gpu_index: 0,
@@ -68,6 +77,7 @@ impl DemoCollector {
                 kind: ProcessKind::Graphics,
                 gpu_util: Some(wave(13.0, 9.0, 1.11, 1.7)),
                 memory_bytes: Some(486 * 1024 * 1024),
+                drm_resident_bytes: Some(440 * 1024 * 1024),
             },
             ProcessSnapshot {
                 gpu_index: 0,
@@ -77,6 +87,7 @@ impl DemoCollector {
                 kind: ProcessKind::Graphics,
                 gpu_util: Some(wave(8.0, 5.0, 1.37, 2.2)),
                 memory_bytes: Some(214 * 1024 * 1024),
+                drm_resident_bytes: Some(180 * 1024 * 1024),
             },
             ProcessSnapshot {
                 gpu_index: 0,
@@ -86,6 +97,7 @@ impl DemoCollector {
                 kind: ProcessKind::ComputeGraphics,
                 gpu_util: Some(wave(5.0, 5.0, 0.91, 4.2)),
                 memory_bytes: Some(362 * 1024 * 1024),
+                drm_resident_bytes: Some(290 * 1024 * 1024),
             },
         ];
 
@@ -96,6 +108,29 @@ impl DemoCollector {
                 .then_with(|| b.memory_bytes.unwrap_or(0).cmp(&a.memory_bytes.unwrap_or(0)))
         });
 
-        Snapshot { gpus, processes }
+        let vram_holders = vec![
+            VramHolderSnapshot {
+                pid: 14122,
+                name: "llama-server".to_string(),
+                user: "ice".to_string(),
+                nvml_memory_bytes: Some(1720 * 1024 * 1024),
+                gpu_indices: vec![0],
+            },
+            VramHolderSnapshot {
+                pid: 18844,
+                name: "python3 pocketapi.py".to_string(),
+                user: "ice".to_string(),
+                nvml_memory_bytes: None,
+                gpu_indices: Vec::new(),
+            },
+        ];
+
+        Snapshot {
+            gpus,
+            processes,
+            vram_holders,
+            uvm_module_refcount: Some(4),
+            uvm_scan_partial: false,
+        }
     }
 }

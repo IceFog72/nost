@@ -1,7 +1,7 @@
-use crate::model::{GpuSnapshot, ProcessSnapshot, Snapshot};
+use crate::model::{GpuSnapshot, ProcessSnapshot, Snapshot, VramHolderSnapshot};
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::ffi::{c_char, c_int, c_long, c_ulong, c_void};
+use std::ffi::{c_int, c_ulong};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
 
@@ -16,6 +16,7 @@ const BORDER: Rgb = Rgb(72, 91, 118);
 const EMPTY: Rgb = Rgb(48, 54, 66);
 const CYAN: Rgb = Rgb(63, 218, 230);
 const BLUE: Rgb = Rgb(94, 168, 255);
+const AMBER: Rgb = Rgb(255, 191, 74);
 
 #[derive(Clone, Copy)]
 struct Rgb(u8, u8, u8);
@@ -48,14 +49,6 @@ struct WinSize {
 
 extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
-    fn time(timer: *mut c_long) -> c_long;
-    fn localtime(timer: *const c_long) -> *mut c_void;
-    fn strftime(
-        output: *mut c_char,
-        max: usize,
-        format: *const c_char,
-        tm: *const c_void,
-    ) -> usize;
 }
 
 const STDOUT_FILENO: c_int = 1;
@@ -142,8 +135,8 @@ fn push_bounded(values: &mut VecDeque<f64>, value: f64, max_len: usize) {
 pub fn render(
     snapshot: &Snapshot,
     history: &History,
-    interval_ms: u64,
-    backend_label: &str,
+    _interval_ms: u64,
+    _backend_label: &str,
     color: bool,
 ) -> io::Result<()> {
     let (terminal_width, terminal_height) = terminal_size();
@@ -159,9 +152,9 @@ pub fn render(
     frame.push_str(INPUT_MODES_OFF);
     frame.push_str("\x1b[H");
 
-    if width < 64 || height < 16 {
+    if width < 64 || height < 27 {
         let message = format!(
-            "nost  resize terminal ({}x{}, need >= 65x16)",
+            "nost  resize terminal ({}x{}, need >= 65x27)",
             terminal_width, terminal_height
         );
         let message = truncate(&message, width.saturating_sub(1));
@@ -178,42 +171,23 @@ pub fn render(
         return flush_frame(frame);
     }
 
-    push_header(&mut frame, width, backend_label, interval_ms, snapshot.gpus.len(), color, truecolor);
-
-    // Keep enough room for a useful process box even when several GPUs exist.
-    // A compact GPU panel uses one row per history graph (9 lines total).
-    // When the terminal is tall enough to fit every GPU plus the process box,
-    // promote both history graphs to two physical rows (11 lines total).
+    // Keep enough room for the two lower boxes even when several GPUs exist.
+    // GPU panel: top + 2 meters + 4-row GPU history + 4-row MEM history +
+    // 4 metric rows + bottom = 16 physical lines. The third box is a direct
+    // /dev/nvidia-uvm ownership view for processes that can retain CUDA/UVM
+    // state without showing attributable VRAM in NVML's process table.
+    let gpu_panel_lines = 16usize;
     let process_min_lines = 5usize;
-    let compact_gpu_panel_lines = 9usize;
-    let tall_gpu_panel_lines = 11usize;
-    let fixed_lines = 1 /* header */ + process_min_lines;
-    let gpu_count_for_fit = snapshot.gpus.len().max(1);
-    let tall_required = fixed_lines
-        .saturating_add(gpu_count_for_fit.saturating_mul(tall_gpu_panel_lines + 1));
-    let graph_rows = if height >= tall_required { 2 } else { 1 };
-    let gpu_panel_lines = if graph_rows == 2 {
-        tall_gpu_panel_lines
-    } else {
-        compact_gpu_panel_lines
-    };
+    let holders_min_lines = 6usize;
+    let fixed_lines = process_min_lines + holders_min_lines;
     let max_gpu_panels = height
         .saturating_sub(fixed_lines)
-        .checked_div(gpu_panel_lines + 1)
+        .checked_div(gpu_panel_lines)
         .unwrap_or(0)
         .max(1);
 
     for gpu in snapshot.gpus.iter().take(max_gpu_panels) {
-        push_gpu_panel(
-            &mut frame,
-            gpu,
-            history,
-            width,
-            graph_rows,
-            color,
-            truecolor,
-        );
-        frame.push('\n');
+        push_gpu_panel(&mut frame, gpu, history, width, color, truecolor);
     }
 
     if snapshot.gpus.len() > max_gpu_panels {
@@ -230,17 +204,30 @@ pub fn render(
 
     let lines_before_process = count_newlines(&frame);
     let remaining = height.saturating_sub(lines_before_process);
-    if remaining >= 4 {
+    let process_budget = remaining.saturating_sub(holders_min_lines);
+    if process_budget >= 4 {
         push_process_panel(
             &mut frame,
             &snapshot.processes,
             width,
-            remaining,
+            process_budget,
             color,
             truecolor,
         );
     }
 
+    let lines_before_holders = count_newlines(&frame);
+    let holder_budget = height.saturating_sub(lines_before_holders);
+    if holder_budget >= 5 {
+        push_vram_holders_panel(
+            &mut frame,
+            snapshot,
+            width,
+            holder_budget,
+            color,
+            truecolor,
+        );
+    }
 
     frame.push_str("\x1b[J");
     flush_frame(frame)
@@ -252,51 +239,11 @@ fn flush_frame(frame: String) -> io::Result<()> {
     out.flush()
 }
 
-fn push_header(
-    frame: &mut String,
-    width: usize,
-    backend: &str,
-    interval_ms: u64,
-    gpu_count: usize,
-    color: bool,
-    truecolor: bool,
-) {
-    let left_plain = "nost  nvidia";
-    let backend_short = if backend == "NVML direct" { "NVML" } else { backend };
-    let right = format!(
-        "{}   {}   {} ms   {} GPU{}",
-        local_clock(),
-        backend_short,
-        interval_ms,
-        gpu_count,
-        if gpu_count == 1 { "" } else { "s" }
-    );
-    let gap = width
-        .saturating_sub(left_plain.chars().count() + right.chars().count())
-        .max(1);
-
-    if color {
-        let accent = fg(ACCENT, truecolor);
-        let muted = fg(MUTED, truecolor);
-        let text = fg(TEXT, truecolor);
-        let _ = writeln!(
-            frame,
-            "{BOLD}{accent}nost{RESET}  {muted}nvidia{RESET}{}{}{}{right}{RESET}",
-            " ".repeat(gap),
-            DIM,
-            text,
-        );
-    } else {
-        let _ = writeln!(frame, "nost  nvidia{}{}", " ".repeat(gap), right);
-    }
-}
-
 fn push_gpu_panel(
     frame: &mut String,
     gpu: &GpuSnapshot,
     history: &History,
     width: usize,
-    graph_rows: usize,
     color: bool,
     truecolor: bool,
 ) {
@@ -359,13 +306,17 @@ fn push_gpu_panel(
     let mem_styled = style(&mem_plain, CYAN, color, truecolor);
     push_panel_lr(frame, &mem_left, &mem_plain, &mem_styled, inner, color, truecolor);
 
-    let graph_width = inner.saturating_sub(12).max(12);
+    // History graphs are vertically graded like btop: color is tied to the
+    // utilization row (low rows cool, high rows hot), not to each time column.
+    // This makes a spike climb through green/yellow/orange/red bands instead of
+    // painting the whole spike a single severity color.
+    let graph_width = inner.saturating_sub(8).max(12);
     push_history_graph(
         frame,
         "gpu",
         history.gpu(gpu.index),
         graph_width,
-        graph_rows,
+        4,
         Grade::Heat,
         inner,
         color,
@@ -376,13 +327,22 @@ fn push_gpu_panel(
         "mem",
         history.memory(gpu.index),
         graph_width,
-        graph_rows,
+        4,
         Grade::Memory,
         inner,
         color,
         truecolor,
     );
 
+    let temp_metric = metric(
+        "temperature",
+        &temp_plain,
+        gpu.temperature_c
+            .map(|_| grade_rgb(temperature_grade(gpu), Grade::Heat))
+            .unwrap_or(MUTED),
+        color,
+        truecolor,
+    );
     let power_plain = match (gpu.power_mw, gpu.power_limit_mw) {
         (Some(now), Some(limit)) => format!("{:.0}W / {:.0}W", now as f64 / 1000.0, limit as f64 / 1000.0),
         (Some(now), None) => format!("{:.0}W", now as f64 / 1000.0),
@@ -404,6 +364,7 @@ fn push_gpu_panel(
         .map(|v| format!("{v}%"))
         .unwrap_or_else(|| "--".into());
     let fan_metric = metric("fan", &fan_plain, BLUE, color, truecolor);
+    push_panel_columns(frame, &[temp_metric, power_metric, fan_metric], inner, color, truecolor);
 
     let core_plain = gpu
         .graphics_clock_mhz
@@ -413,8 +374,11 @@ fn push_gpu_panel(
         .memory_clock_mhz
         .map(|v| format!("{v} MHz"))
         .unwrap_or_else(|| "--".into());
+    let vram_plain = format_memory_pair_compact(gpu.memory_used, gpu.memory_total);
     let core_metric = metric("core clock", &core_plain, TEXT, color, truecolor);
     let memory_metric = metric("mem clock", &memory_clock_plain, TEXT, color, truecolor);
+    let vram_metric = metric("vram", &vram_plain, CYAN, color, truecolor);
+    push_panel_columns(frame, &[core_metric, memory_metric, vram_metric], inner, color, truecolor);
 
     let limit_plain = gpu.clock_limit.as_deref().unwrap_or("--");
     let limit_display = truncate(limit_plain, 12);
@@ -425,25 +389,15 @@ fn push_gpu_panel(
         color,
         truecolor,
     );
-    let video_plain = format_video_util(gpu.encoder_util_percent, gpu.decoder_util_percent);
-    let video_peak = gpu
-        .encoder_util_percent
-        .into_iter()
-        .chain(gpu.decoder_util_percent)
-        .max()
-        .unwrap_or(0) as f64;
-    let video_metric = metric(
-        "video",
-        &video_plain,
-        grade_rgb(video_peak, Grade::Memory),
+    let video_metric = video_metric(
+        gpu.encoder_util_percent,
+        gpu.decoder_util_percent,
         color,
         truecolor,
     );
-    push_panel_columns(frame, &[power_metric, fan_metric, video_metric], inner, color, truecolor);
-    push_panel_columns(frame, &[core_metric, memory_metric, limit_metric], inner, color, truecolor);
-
     let thermal_plain = format_temperature_thresholds(gpu);
     let thermal_metric = metric("thermal", &thermal_plain, temperature_limit_color(gpu), color, truecolor);
+    push_panel_columns(frame, &[limit_metric, video_metric, thermal_metric], inner, color, truecolor);
 
     let pcie_current = format_pcie_link(gpu.pcie_current_gen, gpu.pcie_current_width);
     let pcie_max = format_pcie_link(gpu.pcie_max_gen, gpu.pcie_max_width);
@@ -454,10 +408,14 @@ fn push_gpu_panel(
     } else {
         format!("{pcie_current} / {pcie_max}")
     };
-    let traffic_plain = format_pcie_traffic(gpu.pcie_tx_kb_per_s, gpu.pcie_rx_kb_per_s);
     let pcie_metric = metric("pcie", &pcie_plain, BLUE, color, truecolor);
-    let traffic_metric = metric("traffic", &traffic_plain, CYAN, color, truecolor);
-    push_panel_columns(frame, &[thermal_metric, pcie_metric, traffic_metric], inner, color, truecolor);
+    let traffic_metric = traffic_metric(
+        gpu.pcie_tx_kb_per_s,
+        gpu.pcie_rx_kb_per_s,
+        color,
+        truecolor,
+    );
+    push_panel_columns(frame, &[pcie_metric, traffic_metric], inner, color, truecolor);
 
     push_panel_bottom(frame, width, color, truecolor);
 }
@@ -499,14 +457,39 @@ fn clock_limit_color(limit: &str) -> Rgb {
     }
 }
 
-fn format_video_util(encoder: Option<u32>, decoder: Option<u32>) -> String {
+fn video_metric(
+    encoder: Option<u32>,
+    decoder: Option<u32>,
+    color: bool,
+    truecolor: bool,
+) -> Metric {
     let enc = encoder
         .map(|v| format!("{v}%"))
         .unwrap_or_else(|| "--".to_string());
     let dec = decoder
         .map(|v| format!("{v}%"))
         .unwrap_or_else(|| "--".to_string());
-    format!("ENC{enc} DEC{dec}")
+    let plain = format!("video  ENC {enc}  DEC {dec}");
+    let styled = if color {
+        let enc_color = encoder
+            .map(|v| grade_rgb(v as f64, Grade::Memory))
+            .unwrap_or(MUTED);
+        let dec_color = decoder
+            .map(|v| grade_rgb(v as f64, Grade::Memory))
+            .unwrap_or(MUTED);
+        format!(
+            "{}{label}{RESET}  {}ENC{RESET} {}{enc}{RESET}  {}DEC{RESET} {}{dec}{RESET}",
+            fg(MUTED, truecolor),
+            fg(MUTED, truecolor),
+            fg(enc_color, truecolor),
+            fg(MUTED, truecolor),
+            fg(dec_color, truecolor),
+            label = "video",
+        )
+    } else {
+        plain.clone()
+    };
+    Metric { plain, styled }
 }
 
 fn format_temperature_thresholds(gpu: &GpuSnapshot) -> String {
@@ -531,27 +514,11 @@ fn format_pcie_link(generation: Option<u32>, width: Option<u32>) -> String {
 }
 
 fn format_pcie_rate(kb_per_s: u32) -> String {
-    // NVML reports PCIe throughput in KB/s. Keep small values in KB/s,
-    // promote to MB/s and GB/s, and retain one decimal below 10 units so
-    // readings such as 1.4 MB/s do not collapse to an unhelpful "1MB/s".
-    let kb = kb_per_s as f64;
-    const KB_PER_MB: f64 = 1000.0;
-    const KB_PER_GB: f64 = 1000.0 * 1000.0;
-
-    if kb >= KB_PER_GB {
-        let gb = kb / KB_PER_GB;
-        if gb < 10.0 {
-            format!("{gb:.1} GB/s")
-        } else {
-            format!("{gb:.0} GB/s")
-        }
-    } else if kb >= KB_PER_MB {
-        let mb = kb / KB_PER_MB;
-        if mb < 10.0 {
-            format!("{mb:.1} MB/s")
-        } else {
-            format!("{mb:.0} MB/s")
-        }
+    let value = kb_per_s as f64;
+    if value >= 1_000_000.0 {
+        format!("{:.1} GB/s", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.0} MB/s", value / 1_000.0)
     } else {
         format!("{kb_per_s} KB/s")
     }
@@ -561,6 +528,31 @@ fn format_pcie_traffic(tx: Option<u32>, rx: Option<u32>) -> String {
     let tx = tx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
     let rx = rx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
     format!("TX {tx}  RX {rx}")
+}
+
+fn traffic_metric(
+    tx: Option<u32>,
+    rx: Option<u32>,
+    color: bool,
+    truecolor: bool,
+) -> Metric {
+    let tx_value = tx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
+    let rx_value = rx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
+    let plain = format!("traffic  TX {tx_value}  RX {rx_value}");
+    let styled = if color {
+        format!(
+            "{}{label}{RESET}  {}TX{RESET} {}{tx_value}{RESET}  {}RX{RESET} {}{rx_value}{RESET}",
+            fg(MUTED, truecolor),
+            fg(BLUE, truecolor),
+            fg(CYAN, truecolor),
+            fg(BLUE, truecolor),
+            fg(CYAN, truecolor),
+            label = "traffic",
+        )
+    } else {
+        plain.clone()
+    };
+    Metric { plain, styled }
 }
 
 #[derive(Clone)]
@@ -665,6 +657,183 @@ fn push_process_panel(
     }
 
     push_panel_bottom(frame, width, color, truecolor);
+}
+
+fn push_vram_holders_panel(
+    frame: &mut String,
+    snapshot: &Snapshot,
+    width: usize,
+    available_lines: usize,
+    color: bool,
+    truecolor: bool,
+) {
+    let holder_count = snapshot.vram_holders.len();
+    let title_plain = format!("vram holders  {holder_count} UVM");
+    let title_styled = if color {
+        format!(
+            "{BOLD}{}vram holders{RESET}  {}{holder_count} UVM{RESET}",
+            fg(ACCENT, truecolor),
+            fg(MUTED, truecolor),
+        )
+    } else {
+        title_plain.clone()
+    };
+    push_panel_top(frame, &title_plain, &title_styled, width, color, truecolor);
+
+    let inner = width.saturating_sub(2);
+    let unattributed = snapshot
+        .gpus
+        .iter()
+        .map(|gpu| gpu.memory_used.saturating_sub(gpu.memory_processes))
+        .fold(0u64, u64::saturating_add);
+    let refs = snapshot
+        .uvm_module_refcount
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "--".to_string());
+    let scan = if snapshot.uvm_scan_partial { "partial" } else { "complete" };
+    let summary_plain = format!(
+        " unattributed {}   UVM module refs {refs}   scan {scan}",
+        format_memory_pretty(unattributed)
+    );
+    let summary = if color {
+        format!(
+            " {}unattributed{RESET} {}{}{RESET}   {}UVM module refs{RESET} {}{refs}{RESET}   {}scan{RESET} {}{}{RESET}",
+            fg(MUTED, truecolor),
+            fg(AMBER, truecolor),
+            format_memory_pretty(unattributed),
+            fg(MUTED, truecolor),
+            fg(TEXT, truecolor),
+            fg(MUTED, truecolor),
+            fg(if snapshot.uvm_scan_partial { AMBER } else { ACCENT }, truecolor),
+            scan,
+        )
+    } else {
+        summary_plain.clone()
+    };
+    push_panel_line(frame, &summary, inner, color, truecolor);
+
+    let columns = holder_columns(inner);
+    let header = holder_header(&columns, color, truecolor);
+    push_panel_line(frame, &header, inner, color, truecolor);
+
+    // top + summary + header + bottom consume four lines.
+    let rows_available = available_lines.saturating_sub(4);
+    let data_rows = if snapshot.vram_holders.len() > rows_available && rows_available > 0 {
+        rows_available.saturating_sub(1)
+    } else {
+        rows_available
+    };
+
+    for holder in snapshot.vram_holders.iter().take(data_rows) {
+        let line = holder_line(holder, &columns, color, truecolor);
+        push_panel_line(frame, &line, inner, color, truecolor);
+    }
+
+    if snapshot.vram_holders.is_empty() && rows_available > 0 {
+        let plain = " no visible /dev/nvidia-uvm holders";
+        push_panel_line(
+            frame,
+            &style(plain, MUTED, color, truecolor),
+            inner,
+            color,
+            truecolor,
+        );
+    } else if snapshot.vram_holders.len() > data_rows && rows_available > data_rows {
+        let hidden = snapshot.vram_holders.len() - data_rows;
+        let plain = format!(" … {hidden} more UVM holder{}", if hidden == 1 { "" } else { "s" });
+        push_panel_line(
+            frame,
+            &style(&plain, MUTED, color, truecolor),
+            inner,
+            color,
+            truecolor,
+        );
+    }
+
+    push_panel_bottom(frame, width, color, truecolor);
+}
+
+struct HolderColumns {
+    pid: usize,
+    user: usize,
+    gpu: usize,
+    name: usize,
+    memory: usize,
+}
+
+fn holder_columns(inner: usize) -> HolderColumns {
+    let pid = 10;
+    let user = 13;
+    let gpu = 9;
+    let memory = 13;
+    let fixed = pid + user + gpu + memory;
+    let name = inner.saturating_sub(fixed).max(10);
+    HolderColumns { pid, user, gpu, name, memory }
+}
+
+fn holder_header(c: &HolderColumns, color: bool, truecolor: bool) -> String {
+    let plain = format!(
+        " {:<pw$}{:<uw$}{:<gw$}{:<nw$}{:>mw$}",
+        "PID", "USER", "GPU", "PROCESS", "NVML VRAM",
+        pw = c.pid.saturating_sub(1),
+        uw = c.user,
+        gw = c.gpu,
+        nw = c.name,
+        mw = c.memory,
+    );
+    style(&plain, MUTED, color, truecolor)
+}
+
+fn holder_line(h: &VramHolderSnapshot, c: &HolderColumns, color: bool, truecolor: bool) -> String {
+    let user = truncate(&h.user, c.user.saturating_sub(1));
+    let name = truncate(&h.name, c.name.saturating_sub(1));
+    let gpu_plain = if h.gpu_indices.is_empty() {
+        "--".to_string()
+    } else {
+        h.gpu_indices
+            .iter()
+            .map(|gpu| gpu.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let gpu_plain = truncate(&gpu_plain, c.gpu.saturating_sub(1));
+    let memory_plain = match h.nvml_memory_bytes {
+        Some(0) => "0 MiB".to_string(),
+        Some(bytes) => format_memory_pretty(bytes),
+        None => "--".to_string(),
+    };
+
+    if !color {
+        return format!(
+            " {:<pw$}{:<uw$}{:<gw$}{:<nw$}{:>mw$}",
+            h.pid,
+            user,
+            gpu_plain,
+            name,
+            memory_plain,
+            pw = c.pid.saturating_sub(1),
+            uw = c.user,
+            gw = c.gpu,
+            nw = c.name,
+            mw = c.memory,
+        );
+    }
+
+    let pid_field = format!(" {:<pw$}", h.pid, pw = c.pid.saturating_sub(1));
+    let user_field = format!("{:<uw$}", user, uw = c.user);
+    let gpu_field = format!("{:<gw$}", gpu_plain, gw = c.gpu);
+    let name_field = format!("{:<nw$}", name, nw = c.name);
+    let memory_field = format!("{:>mw$}", memory_plain, mw = c.memory);
+    let memory_color = if h.nvml_memory_bytes.is_some() { CYAN } else { AMBER };
+
+    format!(
+        "{}{}{RESET}{}{}{RESET}{}{}{RESET}{}{}{RESET}{}{}{RESET}",
+        fg(MUTED, truecolor), pid_field,
+        fg(TEXT, truecolor), user_field,
+        fg(BLUE, truecolor), gpu_field,
+        fg(TEXT, truecolor), name_field,
+        fg(memory_color, truecolor), memory_field,
+    )
 }
 
 struct ProcessColumns {
@@ -882,15 +1051,13 @@ fn push_history_graph(
     color: bool,
     truecolor: bool,
 ) {
-    let rows = rows.clamp(1, 2);
-    let graph_rows = if rows == 2 {
-        vertical_graph_graded(values, width, grade, color, truecolor)
-    } else {
-        vec![spark_graded(values, width, grade, color, truecolor)]
-    };
+    let rows = rows.max(1);
+    let rendered = history_graph_rows(values, width, rows, grade, color, truecolor);
 
-    for (row, graph) in graph_rows.into_iter().enumerate() {
-        let prefix = if row == 0 {
+    for (screen_row, graph_row) in rendered.into_iter().enumerate() {
+        // Only the top line needs the label; keeping the remaining left margin
+        // blank makes the vertical severity bands visually continuous.
+        let prefix = if screen_row == 0 {
             if color {
                 format!(" {}{label}{RESET}  ", fg(MUTED, truecolor))
             } else {
@@ -899,114 +1066,60 @@ fn push_history_graph(
         } else {
             "      ".to_string()
         };
-        push_panel_line(frame, &format!("{prefix}{graph}"), inner, color, truecolor);
+        let line = format!("{prefix}{graph_row}");
+        push_panel_line(frame, &line, inner, color, truecolor);
     }
 }
 
-fn vertical_graph_graded(
+fn history_graph_rows(
     values: Option<&VecDeque<f64>>,
     width: usize,
+    rows: usize,
     grade: Grade,
     color: bool,
     truecolor: bool,
 ) -> Vec<String> {
-    // Two terminal rows give us sixteen vertical eighth-block levels. The
-    // color is based on the vertical level actually reached, not just the
-    // sample value, producing the btop-style green -> yellow -> orange -> red
-    // stack seen in multi-row graphs.
-    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    const ROWS: usize = 2;
-    const LEVELS_PER_ROW: usize = 8;
-    const TOTAL_LEVELS: usize = ROWS * LEVELS_PER_ROW;
+    // Each terminal row contains 8 vertical sub-levels. A sample therefore has
+    // rows*8 possible heights while the row's color remains fixed horizontally.
+    const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-    let mut rows = vec![String::with_capacity(width * 20), String::with_capacity(width * 20)];
-    let shown: Vec<f64> = match values {
+    let rows = rows.max(1);
+    let visible: Vec<f64> = match values {
         Some(values) => {
             let skip = values.len().saturating_sub(width);
-            let mut out = vec![0.0; width.saturating_sub(values.len().min(width))];
-            out.extend(values.iter().skip(skip).copied());
-            out
+            let mut samples = vec![0.0; width.saturating_sub(values.len().min(width))];
+            samples.extend(values.iter().skip(skip).map(|value| value.clamp(0.0, 100.0)));
+            samples
         }
         None => vec![0.0; width],
     };
 
-    for row in 0..ROWS {
-        let row_floor = (ROWS - 1 - row) * LEVELS_PER_ROW;
-        for value in &shown {
-            let value = value.clamp(0.0, 100.0);
-            let filled_total = ((value / 100.0) * TOTAL_LEVELS as f64).round() as usize;
-            let row_fill = filled_total
-                .saturating_sub(row_floor)
-                .min(LEVELS_PER_ROW);
+    let mut output = Vec::with_capacity(rows);
+    for screen_row in 0..rows {
+        // screen_row=0 is the hottest/top band; band_from_bottom=0 is bottom.
+        let band_from_bottom = rows - 1 - screen_row;
+        let band_low = band_from_bottom as f64 * 100.0 / rows as f64;
+        let band_high = (band_from_bottom + 1) as f64 * 100.0 / rows as f64;
+        let band_mid = (band_low + band_high) * 0.5;
+        let row_color = grade_rgb(band_mid, grade);
 
-            if row_fill == 0 {
-                if color {
-                    rows[row].push_str(&fg(EMPTY, truecolor));
-                }
-                // Keep a faint baseline only on the bottom row. The upper row
-                // stays visually empty until the sample crosses 50%.
-                rows[row].push(if row + 1 == ROWS { '▁' } else { ' ' });
-                if color {
-                    rows[row].push_str(RESET);
-                }
-                continue;
-            }
-
-            let absolute_level = row_floor + row_fill;
-            let vertical_percent = absolute_level as f64 * 100.0 / TOTAL_LEVELS as f64;
-            if color {
-                rows[row].push_str(&fg(grade_rgb(vertical_percent, grade), truecolor));
-            }
-            rows[row].push(BLOCKS[row_fill - 1]);
-            if color {
-                rows[row].push_str(RESET);
-            }
-        }
-    }
-
-    rows
-}
-
-fn spark_graded(
-    values: Option<&VecDeque<f64>>,
-    width: usize,
-    grade: Grade,
-    color: bool,
-    truecolor: bool,
-) -> String {
-    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let Some(values) = values else {
-        return if color {
-            format!("{}{}{}", fg(EMPTY, truecolor), "▁".repeat(width), RESET)
-        } else {
-            "▁".repeat(width)
-        };
-    };
-
-    let skip = values.len().saturating_sub(width);
-    let pad = width.saturating_sub(values.len().min(width));
-    let mut output = String::with_capacity(width * 20);
-    if pad > 0 {
+        let mut line = String::with_capacity(width * 4 + 32);
         if color {
-            output.push_str(&fg(EMPTY, truecolor));
+            line.push_str(&fg(row_color, truecolor));
         }
-        output.push_str(&"▁".repeat(pad));
+
+        for value in &visible {
+            let occupancy = ((*value - band_low) / (band_high - band_low)).clamp(0.0, 1.0);
+            let level = (occupancy * 8.0).round() as usize;
+            line.push(BLOCKS[level.min(8)]);
+        }
+
         if color {
-            output.push_str(RESET);
+            line.push_str(RESET);
         }
+        output.push(line);
     }
 
-    for value in values.iter().skip(skip) {
-        let value = value.clamp(0.0, 100.0);
-        let index = ((value / 100.0) * 7.0).round() as usize;
-        if color {
-            output.push_str(&fg(grade_rgb(value, grade), truecolor));
-        }
-        output.push(BLOCKS[index.min(7)]);
-    }
-    if color {
-        output.push_str(RESET);
-    }
     output
 }
 
@@ -1091,6 +1204,20 @@ fn format_memory_pair_pretty(used: u64, total: u64) -> String {
     format!("{} / {}", format_memory_pretty(used), format_memory_pretty(total))
 }
 
+fn format_memory_compact(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * MIB;
+    if bytes as f64 >= GIB {
+        format!("{:.1}G", bytes as f64 / GIB)
+    } else {
+        format!("{:.0}M", bytes as f64 / MIB)
+    }
+}
+
+fn format_memory_pair_compact(used: u64, total: u64) -> String {
+    format!("{}/{}", format_memory_compact(used), format_memory_compact(total))
+}
+
 fn truncate(value: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -1131,30 +1258,6 @@ fn count_newlines(value: &str) -> usize {
     value.bytes().filter(|byte| *byte == b'\n').count()
 }
 
-fn local_clock() -> String {
-    let mut now: c_long = 0;
-    unsafe {
-        let _ = time(&mut now as *mut c_long);
-        let tm = localtime(&now as *const c_long);
-        if tm.is_null() {
-            return "--:--:--".to_string();
-        }
-        let mut buffer = [0i8; 16];
-        let format = b"%H:%M:%S\0";
-        let written = strftime(
-            buffer.as_mut_ptr(),
-            buffer.len(),
-            format.as_ptr() as *const c_char,
-            tm,
-        );
-        if written == 0 {
-            return "--:--:--".to_string();
-        }
-        let bytes = std::slice::from_raw_parts(buffer.as_ptr() as *const u8, written);
-        String::from_utf8_lossy(bytes).into_owned()
-    }
-}
-
 fn terminal_size() -> (u16, u16) {
     let mut size = WinSize::default();
     let ok = unsafe { ioctl(STDOUT_FILENO, TIOCGWINSZ, &mut size) } == 0;
@@ -1192,7 +1295,7 @@ pub fn should_use_color(force_no_color: bool) -> bool {
 mod tests {
     use super::{
         format_memory_pretty, format_pcie_link, format_pcie_rate, format_pcie_traffic, grade_rgb,
-        graded_bar, spark_graded, truncate, vertical_graph_graded, visible_len_ansi, Grade,
+        graded_bar, history_graph_rows, truncate, visible_len_ansi, Grade,
     };
     use std::collections::VecDeque;
 
@@ -1202,10 +1305,22 @@ mod tests {
     }
 
     #[test]
-    fn spark_has_requested_visible_width() {
+    fn history_graph_has_requested_rows_and_width() {
         let values = VecDeque::from(vec![0.0, 50.0, 100.0]);
-        let output = spark_graded(Some(&values), 7, Grade::Heat, true, true);
-        assert_eq!(visible_len_ansi(&output), 7);
+        let output = history_graph_rows(Some(&values), 7, 4, Grade::Heat, true, true);
+        assert_eq!(output.len(), 4);
+        assert!(output.iter().all(|row| visible_len_ansi(row) == 7));
+    }
+
+    #[test]
+    fn history_graph_colors_are_row_based_not_sample_based() {
+        let values = VecDeque::from(vec![20.0, 90.0, 20.0, 90.0]);
+        let output = history_graph_rows(Some(&values), 4, 4, Grade::Heat, true, true);
+        // Each row emits one foreground-color escape for the whole row. If the
+        // renderer regresses to per-sample grading there will be many more.
+        for row in output {
+            assert_eq!(row.matches("\x1b[38;").count(), 1);
+        }
     }
 
     #[test]
@@ -1234,25 +1349,11 @@ mod tests {
     #[test]
     fn pcie_link_and_traffic_format_are_compact_and_explicit() {
         assert_eq!(format_pcie_link(Some(4), Some(16)), "Gen4 x16");
-        assert_eq!(format_pcie_rate(732), "732 KB/s");
-        assert_eq!(format_pcie_rate(1_000), "1.0 MB/s");
         assert_eq!(format_pcie_rate(185_000), "185 MB/s");
         assert_eq!(format_pcie_rate(1_250_000), "1.2 GB/s");
         assert_eq!(
-            format_pcie_traffic(Some(1_000), Some(732)),
-            "TX 1.0 MB/s  RX 732 KB/s"
+            format_pcie_traffic(Some(185_000), Some(460_000)),
+            "TX 185 MB/s  RX 460 MB/s"
         );
-    }
-
-    #[test]
-    fn tall_graph_uses_two_visible_rows_with_btop_style_vertical_levels() {
-        let values = VecDeque::from(vec![0.0, 25.0, 50.0, 75.0, 100.0]);
-        let rows = vertical_graph_graded(Some(&values), 5, Grade::Heat, false, false);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].chars().count(), 5);
-        assert_eq!(rows[1].chars().count(), 5);
-        assert_eq!(rows[0].chars().next(), Some(' '));
-        assert_eq!(rows[0].chars().last(), Some('█'));
-        assert_eq!(rows[1].chars().last(), Some('█'));
     }
 }
