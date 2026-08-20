@@ -181,9 +181,22 @@ pub fn render(
     push_header(&mut frame, width, backend_label, interval_ms, snapshot.gpus.len(), color, truecolor);
 
     // Keep enough room for a useful process box even when several GPUs exist.
-    let gpu_panel_lines = 10usize;
+    // A compact GPU panel uses one row per history graph (9 lines total).
+    // When the terminal is tall enough to fit every GPU plus the process box,
+    // promote both history graphs to two physical rows (11 lines total).
     let process_min_lines = 5usize;
-    let fixed_lines = 1 /* header */ + 1 /* gap */ + process_min_lines;
+    let compact_gpu_panel_lines = 9usize;
+    let tall_gpu_panel_lines = 11usize;
+    let fixed_lines = 1 /* header */ + process_min_lines;
+    let gpu_count_for_fit = snapshot.gpus.len().max(1);
+    let tall_required = fixed_lines
+        .saturating_add(gpu_count_for_fit.saturating_mul(tall_gpu_panel_lines + 1));
+    let graph_rows = if height >= tall_required { 2 } else { 1 };
+    let gpu_panel_lines = if graph_rows == 2 {
+        tall_gpu_panel_lines
+    } else {
+        compact_gpu_panel_lines
+    };
     let max_gpu_panels = height
         .saturating_sub(fixed_lines)
         .checked_div(gpu_panel_lines + 1)
@@ -191,7 +204,15 @@ pub fn render(
         .max(1);
 
     for gpu in snapshot.gpus.iter().take(max_gpu_panels) {
-        push_gpu_panel(&mut frame, gpu, history, width, color, truecolor);
+        push_gpu_panel(
+            &mut frame,
+            gpu,
+            history,
+            width,
+            graph_rows,
+            color,
+            truecolor,
+        );
         frame.push('\n');
     }
 
@@ -275,6 +296,7 @@ fn push_gpu_panel(
     gpu: &GpuSnapshot,
     history: &History,
     width: usize,
+    graph_rows: usize,
     color: bool,
     truecolor: bool,
 ) {
@@ -338,30 +360,29 @@ fn push_gpu_panel(
     push_panel_lr(frame, &mem_left, &mem_plain, &mem_styled, inner, color, truecolor);
 
     let graph_width = inner.saturating_sub(12).max(12);
-    let gpu_graph = spark_graded(history.gpu(gpu.index), graph_width, Grade::Heat, color, truecolor);
-    let mem_graph = spark_graded(history.memory(gpu.index), graph_width, Grade::Memory, color, truecolor);
-    let gpu_graph_line = if color {
-        format!(" {}gpu{RESET}  {gpu_graph}", fg(MUTED, truecolor))
-    } else {
-        format!(" gpu  {gpu_graph}")
-    };
-    let mem_graph_line = if color {
-        format!(" {}mem{RESET}  {mem_graph}", fg(MUTED, truecolor))
-    } else {
-        format!(" mem  {mem_graph}")
-    };
-    push_panel_line(frame, &gpu_graph_line, inner, color, truecolor);
-    push_panel_line(frame, &mem_graph_line, inner, color, truecolor);
-
-    let temp_metric = metric(
-        "temperature",
-        &temp_plain,
-        gpu.temperature_c
-            .map(|_| grade_rgb(temperature_grade(gpu), Grade::Heat))
-            .unwrap_or(MUTED),
+    push_history_graph(
+        frame,
+        "gpu",
+        history.gpu(gpu.index),
+        graph_width,
+        graph_rows,
+        Grade::Heat,
+        inner,
         color,
         truecolor,
     );
+    push_history_graph(
+        frame,
+        "mem",
+        history.memory(gpu.index),
+        graph_width,
+        graph_rows,
+        Grade::Memory,
+        inner,
+        color,
+        truecolor,
+    );
+
     let power_plain = match (gpu.power_mw, gpu.power_limit_mw) {
         (Some(now), Some(limit)) => format!("{:.0}W / {:.0}W", now as f64 / 1000.0, limit as f64 / 1000.0),
         (Some(now), None) => format!("{:.0}W", now as f64 / 1000.0),
@@ -383,7 +404,6 @@ fn push_gpu_panel(
         .map(|v| format!("{v}%"))
         .unwrap_or_else(|| "--".into());
     let fan_metric = metric("fan", &fan_plain, BLUE, color, truecolor);
-    push_panel_columns(frame, &[temp_metric, power_metric, fan_metric], inner, color, truecolor);
 
     let core_plain = gpu
         .graphics_clock_mhz
@@ -393,11 +413,8 @@ fn push_gpu_panel(
         .memory_clock_mhz
         .map(|v| format!("{v} MHz"))
         .unwrap_or_else(|| "--".into());
-    let vram_plain = format_memory_pair_compact(gpu.memory_used, gpu.memory_total);
     let core_metric = metric("core clock", &core_plain, TEXT, color, truecolor);
     let memory_metric = metric("mem clock", &memory_clock_plain, TEXT, color, truecolor);
-    let vram_metric = metric("vram", &vram_plain, CYAN, color, truecolor);
-    push_panel_columns(frame, &[core_metric, memory_metric, vram_metric], inner, color, truecolor);
 
     let limit_plain = gpu.clock_limit.as_deref().unwrap_or("--");
     let limit_display = truncate(limit_plain, 12);
@@ -422,9 +439,11 @@ fn push_gpu_panel(
         color,
         truecolor,
     );
+    push_panel_columns(frame, &[power_metric, fan_metric, video_metric], inner, color, truecolor);
+    push_panel_columns(frame, &[core_metric, memory_metric, limit_metric], inner, color, truecolor);
+
     let thermal_plain = format_temperature_thresholds(gpu);
     let thermal_metric = metric("thermal", &thermal_plain, temperature_limit_color(gpu), color, truecolor);
-    push_panel_columns(frame, &[limit_metric, video_metric, thermal_metric], inner, color, truecolor);
 
     let pcie_current = format_pcie_link(gpu.pcie_current_gen, gpu.pcie_current_width);
     let pcie_max = format_pcie_link(gpu.pcie_max_gen, gpu.pcie_max_width);
@@ -438,7 +457,7 @@ fn push_gpu_panel(
     let traffic_plain = format_pcie_traffic(gpu.pcie_tx_kb_per_s, gpu.pcie_rx_kb_per_s);
     let pcie_metric = metric("pcie", &pcie_plain, BLUE, color, truecolor);
     let traffic_metric = metric("traffic", &traffic_plain, CYAN, color, truecolor);
-    push_panel_columns(frame, &[pcie_metric, traffic_metric], inner, color, truecolor);
+    push_panel_columns(frame, &[thermal_metric, pcie_metric, traffic_metric], inner, color, truecolor);
 
     push_panel_bottom(frame, width, color, truecolor);
 }
@@ -512,20 +531,36 @@ fn format_pcie_link(generation: Option<u32>, width: Option<u32>) -> String {
 }
 
 fn format_pcie_rate(kb_per_s: u32) -> String {
-    let value = kb_per_s as f64;
-    if value >= 1_000_000.0 {
-        format!("{:.1}GB/s", value / 1_000_000.0)
-    } else if value >= 1_000.0 {
-        format!("{:.0}MB/s", value / 1_000.0)
+    // NVML reports PCIe throughput in KB/s. Keep small values in KB/s,
+    // promote to MB/s and GB/s, and retain one decimal below 10 units so
+    // readings such as 1.4 MB/s do not collapse to an unhelpful "1MB/s".
+    let kb = kb_per_s as f64;
+    const KB_PER_MB: f64 = 1000.0;
+    const KB_PER_GB: f64 = 1000.0 * 1000.0;
+
+    if kb >= KB_PER_GB {
+        let gb = kb / KB_PER_GB;
+        if gb < 10.0 {
+            format!("{gb:.1} GB/s")
+        } else {
+            format!("{gb:.0} GB/s")
+        }
+    } else if kb >= KB_PER_MB {
+        let mb = kb / KB_PER_MB;
+        if mb < 10.0 {
+            format!("{mb:.1} MB/s")
+        } else {
+            format!("{mb:.0} MB/s")
+        }
     } else {
-        format!("{kb_per_s}KB/s")
+        format!("{kb_per_s} KB/s")
     }
 }
 
 fn format_pcie_traffic(tx: Option<u32>, rx: Option<u32>) -> String {
     let tx = tx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
     let rx = rx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
-    format!("TX{tx} RX{rx}")
+    format!("TX {tx}  RX {rx}")
 }
 
 #[derive(Clone)]
@@ -836,6 +871,102 @@ fn graded_bar(percent: f64, width: usize, grade: Grade, color: bool, truecolor: 
     output
 }
 
+fn push_history_graph(
+    frame: &mut String,
+    label: &str,
+    values: Option<&VecDeque<f64>>,
+    width: usize,
+    rows: usize,
+    grade: Grade,
+    inner: usize,
+    color: bool,
+    truecolor: bool,
+) {
+    let rows = rows.clamp(1, 2);
+    let graph_rows = if rows == 2 {
+        vertical_graph_graded(values, width, grade, color, truecolor)
+    } else {
+        vec![spark_graded(values, width, grade, color, truecolor)]
+    };
+
+    for (row, graph) in graph_rows.into_iter().enumerate() {
+        let prefix = if row == 0 {
+            if color {
+                format!(" {}{label}{RESET}  ", fg(MUTED, truecolor))
+            } else {
+                format!(" {label}  ")
+            }
+        } else {
+            "      ".to_string()
+        };
+        push_panel_line(frame, &format!("{prefix}{graph}"), inner, color, truecolor);
+    }
+}
+
+fn vertical_graph_graded(
+    values: Option<&VecDeque<f64>>,
+    width: usize,
+    grade: Grade,
+    color: bool,
+    truecolor: bool,
+) -> Vec<String> {
+    // Two terminal rows give us sixteen vertical eighth-block levels. The
+    // color is based on the vertical level actually reached, not just the
+    // sample value, producing the btop-style green -> yellow -> orange -> red
+    // stack seen in multi-row graphs.
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    const ROWS: usize = 2;
+    const LEVELS_PER_ROW: usize = 8;
+    const TOTAL_LEVELS: usize = ROWS * LEVELS_PER_ROW;
+
+    let mut rows = vec![String::with_capacity(width * 20), String::with_capacity(width * 20)];
+    let shown: Vec<f64> = match values {
+        Some(values) => {
+            let skip = values.len().saturating_sub(width);
+            let mut out = vec![0.0; width.saturating_sub(values.len().min(width))];
+            out.extend(values.iter().skip(skip).copied());
+            out
+        }
+        None => vec![0.0; width],
+    };
+
+    for row in 0..ROWS {
+        let row_floor = (ROWS - 1 - row) * LEVELS_PER_ROW;
+        for value in &shown {
+            let value = value.clamp(0.0, 100.0);
+            let filled_total = ((value / 100.0) * TOTAL_LEVELS as f64).round() as usize;
+            let row_fill = filled_total
+                .saturating_sub(row_floor)
+                .min(LEVELS_PER_ROW);
+
+            if row_fill == 0 {
+                if color {
+                    rows[row].push_str(&fg(EMPTY, truecolor));
+                }
+                // Keep a faint baseline only on the bottom row. The upper row
+                // stays visually empty until the sample crosses 50%.
+                rows[row].push(if row + 1 == ROWS { '▁' } else { ' ' });
+                if color {
+                    rows[row].push_str(RESET);
+                }
+                continue;
+            }
+
+            let absolute_level = row_floor + row_fill;
+            let vertical_percent = absolute_level as f64 * 100.0 / TOTAL_LEVELS as f64;
+            if color {
+                rows[row].push_str(&fg(grade_rgb(vertical_percent, grade), truecolor));
+            }
+            rows[row].push(BLOCKS[row_fill - 1]);
+            if color {
+                rows[row].push_str(RESET);
+            }
+        }
+    }
+
+    rows
+}
+
 fn spark_graded(
     values: Option<&VecDeque<f64>>,
     width: usize,
@@ -960,20 +1091,6 @@ fn format_memory_pair_pretty(used: u64, total: u64) -> String {
     format!("{} / {}", format_memory_pretty(used), format_memory_pretty(total))
 }
 
-fn format_memory_compact(bytes: u64) -> String {
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = 1024.0 * MIB;
-    if bytes as f64 >= GIB {
-        format!("{:.1}G", bytes as f64 / GIB)
-    } else {
-        format!("{:.0}M", bytes as f64 / MIB)
-    }
-}
-
-fn format_memory_pair_compact(used: u64, total: u64) -> String {
-    format!("{}/{}", format_memory_compact(used), format_memory_compact(total))
-}
-
 fn truncate(value: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -1075,7 +1192,7 @@ pub fn should_use_color(force_no_color: bool) -> bool {
 mod tests {
     use super::{
         format_memory_pretty, format_pcie_link, format_pcie_rate, format_pcie_traffic, grade_rgb,
-        graded_bar, spark_graded, truncate, visible_len_ansi, Grade,
+        graded_bar, spark_graded, truncate, vertical_graph_graded, visible_len_ansi, Grade,
     };
     use std::collections::VecDeque;
 
@@ -1117,11 +1234,25 @@ mod tests {
     #[test]
     fn pcie_link_and_traffic_format_are_compact_and_explicit() {
         assert_eq!(format_pcie_link(Some(4), Some(16)), "Gen4 x16");
-        assert_eq!(format_pcie_rate(185_000), "185MB/s");
-        assert_eq!(format_pcie_rate(1_250_000), "1.2GB/s");
+        assert_eq!(format_pcie_rate(732), "732 KB/s");
+        assert_eq!(format_pcie_rate(1_000), "1.0 MB/s");
+        assert_eq!(format_pcie_rate(185_000), "185 MB/s");
+        assert_eq!(format_pcie_rate(1_250_000), "1.2 GB/s");
         assert_eq!(
-            format_pcie_traffic(Some(185_000), Some(460_000)),
-            "TX185MB/s RX460MB/s"
+            format_pcie_traffic(Some(1_000), Some(732)),
+            "TX 1.0 MB/s  RX 732 KB/s"
         );
+    }
+
+    #[test]
+    fn tall_graph_uses_two_visible_rows_with_btop_style_vertical_levels() {
+        let values = VecDeque::from(vec![0.0, 25.0, 50.0, 75.0, 100.0]);
+        let rows = vertical_graph_graded(Some(&values), 5, Grade::Heat, false, false);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].chars().count(), 5);
+        assert_eq!(rows[1].chars().count(), 5);
+        assert_eq!(rows[0].chars().next(), Some(' '));
+        assert_eq!(rows[0].chars().last(), Some('█'));
+        assert_eq!(rows[1].chars().last(), Some('█'));
     }
 }

@@ -50,15 +50,16 @@ Unsupported optional metrics display as `--` instead of failing the monitor.
 The renderer is intentionally small and dependency-free, but the visual hierarchy is now closer to btop:
 
 - bordered GPU and process panels
-- GPU and VRAM history sparklines
+- GPU and VRAM history graphs; they automatically grow from one to two terminal rows when the window is tall enough
 - long utilization bars rather than diagnostic-sized meters
 - local clock in the header
-- three-column thermals/power/fan and clocks/VRAM rows
-- per-sample color grading: cool/green at low load, amber in the middle, coral/red at high load
+- compact three-column telemetry rows without repeating the current temperature or VRAM values already shown beside the main bars
+- btop-style vertical graph grading: lower graph levels are cool/green, then yellow/amber, with orange/coral at the top of tall samples
 - a separate cyan/teal VRAM grade that also turns amber/red near saturation
 - temperature is graded against NVML-reported hardware limits when the GPU exposes them, instead of fixed generic thresholds
 - temperature, power and per-process GPU percentages use the same severity grades
 - compact `limit`, `ENC`/`DEC`, hardware thermal-limit, PCIe link and PCIe TX/RX rows
+- human-readable PCIe traffic scaling such as `TX 1.0 MB/s  RX 732 KB/s` instead of a cramped unparsed counter
 - 24-bit color when the terminal advertises truecolor, with an automatic ANSI-256 fallback
 
 No TUI framework is required: the app still writes a single ANSI frame directly and never registers keyboard or mouse input.
