@@ -22,19 +22,26 @@ pub struct GpuSnapshot {
     /// `used` includes `reserved`.
     pub memory_used: u64,
     /// System-reserved framebuffer memory reported by NVML memory-info v2.
+    #[allow(dead_code)]
     pub memory_reserved: Option<u64>,
     /// Sum of NVML-attributed per-process framebuffer allocations for this GPU.
     pub memory_processes: u64,
     /// Residual allocated VRAM after subtracting NVML-attributed process allocations.
     /// Reserved framebuffer is a separate bucket and is never subtracted twice.
+    #[allow(dead_code)]
     pub memory_other: Option<u64>,
     /// Optional DRM fdinfo resident device-memory accounting, deduplicated by DRM client id.
+    #[allow(dead_code)]
     pub drm_resident: Option<u64>,
+    #[allow(dead_code)]
     pub drm_clients: usize,
+    #[allow(dead_code)]
     pub drm_status: DrmStatus,
     /// True when DRM fdinfo was readable for only a subset of relevant processes.
+    #[allow(dead_code)]
     pub drm_partial: bool,
     /// Normalized PCI BDF used to match DRM fdinfo clients to this GPU.
+    #[allow(dead_code)]
     pub pci_bus_id: Option<String>,
     pub temperature_c: Option<u32>,
     pub temperature_slowdown_c: Option<u32>,
@@ -48,9 +55,13 @@ pub struct GpuSnapshot {
     pub clock_limit: Option<String>,
     pub encoder_util_percent: Option<u32>,
     pub decoder_util_percent: Option<u32>,
+    #[allow(dead_code)]
     pub pcie_current_gen: Option<u32>,
+    #[allow(dead_code)]
     pub pcie_current_width: Option<u32>,
+    #[allow(dead_code)]
     pub pcie_max_gen: Option<u32>,
+    #[allow(dead_code)]
     pub pcie_max_width: Option<u32>,
     pub pcie_tx_kb_per_s: Option<u32>,
     pub pcie_rx_kb_per_s: Option<u32>,
@@ -107,6 +118,7 @@ pub struct ProcessSnapshot {
     pub gpu_util: Option<u32>,
     pub memory_bytes: Option<u64>,
     /// Optional resident device-memory bytes exported through Linux DRM fdinfo.
+    #[allow(dead_code)]
     pub drm_resident_bytes: Option<u64>,
 }
 

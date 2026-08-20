@@ -35,7 +35,6 @@ For the real monitor:
 - graphics and memory clocks
 - active clock-event / performance-limit reasons (power, thermal, hardware slowdown, idle, etc.)
 - NVENC encoder and NVDEC decoder utilization
-- current and maximum PCIe link generation + width
 - PCIe TX/RX throughput
 - compute and graphics process PIDs
 - per-process framebuffer memory
@@ -52,13 +51,13 @@ The renderer is intentionally small and dependency-free, but the visual hierarch
 
 - bordered GPU and process panels
 - GPU and VRAM multi-row history graphs
-- long utilization bars rather than diagnostic-sized meters
-- three-column thermals/power/fan and clocks/VRAM rows
+- current GPU/MEM utilization values are integrated directly into their history graphs; no separate utilization-meter rows
+- compact metric rows without duplicate temperature/VRAM readouts
 - btop-style **row-based** history color grading: bottom rows stay cool/green, middle rows yellow/amber, and upper rows orange/red; the color does not change from time-column to time-column
 - the VRAM graph uses the same row-based geometry with its cyan/teal → yellow → orange/red palette
 - temperature is graded against NVML-reported hardware limits when the GPU exposes them, instead of fixed generic thresholds
 - temperature, power and per-process GPU percentages use the same severity grades
-- compact `limit`, `ENC`/`DEC`, hardware thermal-limit, PCIe link and PCIe TX/RX rows
+- compact `limit`, `ENC`/`DEC`, hardware thermal-limit and PCIe TX/RX traffic rows
 - 24-bit color when the terminal advertises truecolor, with an automatic ANSI-256 fallback
 
 No TUI framework is required: the app still writes a single ANSI frame directly and never registers keyboard or mouse input.
@@ -102,7 +101,7 @@ NVIDIA driver
       Rust NVML FFI loader
        ├── device metrics + thermal limits
        ├── clock-event reasons + video engines
-       ├── PCIe link + TX/RX traffic
+       ├── PCIe TX/RX traffic
        ├── running processes
        └── process utilization
              │
@@ -151,3 +150,43 @@ A UVM holder with `NVML VRAM --` is particularly useful: it means the process ha
 
 If `/proc/<pid>/fd` is hidden by permissions, the summary says `scan partial`; visible holders remain useful but the list is not exhaustive.
 
+
+## v0.4.8 compact metric cleanup
+
+- Removed the duplicate `temperature` and `vram` detail rows.
+- Removed the visible PCIe link-generation/width row. PCIe TX/RX traffic remains available.
+- Repacked the lower telemetry into three rows to reclaim one line of vertical space.
+
+## v0.4.10 graph-only utilization
+
+- Removed the separate horizontal `GPU` and `MEM` utilization-meter rows.
+- The live utilization value is now right-aligned on the top row of each history graph.
+- GPU graph keeps the single temperature readout beside its current percentage.
+- MEM graph keeps the single current/total VRAM readout beside its current percentage.
+- GPU panel shrank from 15 to 13 rows; minimum terminal height is now 24 rows.
+
+## v0.4.11 stacked graph readings
+
+- Split the MEM graph status into three right-edge rows: utilization %, used VRAM, total VRAM.
+- Split the GPU graph status into separate right-edge rows for utilization % and temperature.
+- The graph width now reserves space only for the longest individual reading, giving the history plot more horizontal room.
+- No separate GPU/MEM meter rows were reintroduced.
+
+
+## Resize behavior
+
+`nost` treats `SIGWINCH` as a redraw wake-up, detects geometry changes on every
+frame, clears stale row tails after a resize, disables terminal auto-wrap while
+the dashboard is active, and brackets frames with DEC synchronized-output mode
+when the terminal supports it. These measures prevent old right-edge text and
+borders from being left behind while a terminal window is dragged narrower or
+wider.
+
+
+## v0.4.12 resize-safe redraw
+
+- Wakes the renderer on Linux `SIGWINCH` instead of waiting for the normal sample interval.
+- Performs a full-screen clear only when terminal geometry changes, removing stale right-edge tails.
+- Disables DEC auto-wrap while the dashboard is active so a mid-frame shrink clips instead of wrapping.
+- Uses DEC synchronized-output mode (`2026`) when supported to avoid displaying half-painted frames.
+- Restores wrap, cursor, alternate-screen, mouse/scroll and sync modes on exit.

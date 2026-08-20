@@ -4,19 +4,28 @@ use std::env;
 use std::ffi::{c_int, c_ulong};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const RESET: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
 
 const ACCENT: Rgb = Rgb(98, 255, 118);
 const TEXT: Rgb = Rgb(218, 223, 232);
 const MUTED: Rgb = Rgb(116, 124, 139);
 const BORDER: Rgb = Rgb(72, 91, 118);
-const EMPTY: Rgb = Rgb(48, 54, 66);
 const CYAN: Rgb = Rgb(63, 218, 230);
 const BLUE: Rgb = Rgb(94, 168, 255);
 const AMBER: Rgb = Rgb(255, 191, 74);
+
+// DEC synchronized output. Terminals that implement mode 2026 hold the frame
+// until SYNC_END, which avoids exposing half-drawn resize frames. Unsupported
+// terminals simply ignore these private-mode sequences.
+const SYNC_BEGIN: &str = "\x1b[?2026h";
+const SYNC_END: &str = "\x1b[?2026l";
+
+// width in the high 16 bits, height in the low 16 bits. Zero means no frame
+// has been rendered yet. This is only touched by the single render thread.
+static LAST_TERMINAL_SIZE: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 struct Rgb(u8, u8, u8);
@@ -67,7 +76,10 @@ impl TerminalGuard {
         // Disable alternate-scroll *after* entering the alternate screen.
         // This stops wheel events being translated into ESC[A / ESC[B while
         // nost itself remains completely non-interactive.
-        write!(out, "{}\x1b[?25l\x1b[2J\x1b[H", INPUT_MODES_OFF)?;
+        // Disable auto-wrap while the dashboard owns the terminal. If the
+        // window becomes narrower between TIOCGWINSZ and the actual write,
+        // long rows are clipped instead of wrapping into unrelated rows.
+        write!(out, "{}\x1b[?7l\x1b[?25l\x1b[2J\x1b[H", INPUT_MODES_OFF)?;
         out.flush()?;
         Ok(Self { inline })
     }
@@ -76,7 +88,9 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut out = io::stdout().lock();
-        let _ = write!(out, "{}\x1b[0m\x1b[?25h", INPUT_MODES_OFF);
+        // Always leave synchronized-output mode, restore auto-wrap, and then
+        // restore the cursor even if the previous frame was interrupted.
+        let _ = write!(out, "{SYNC_END}{}\x1b[0m\x1b[?7h\x1b[?25h", INPUT_MODES_OFF);
         if !self.inline {
             let _ = write!(out, "\x1b[?1049l");
         } else {
@@ -149,12 +163,23 @@ pub fn render(
     let truecolor = supports_truecolor();
 
     let mut frame = String::with_capacity(width.saturating_mul(height).saturating_mul(4));
+    frame.push_str(SYNC_BEGIN);
     frame.push_str(INPUT_MODES_OFF);
+
+    let size_key = terminal_size_key(terminal_width as u16, terminal_height as u16);
+    let previous_size = LAST_TERMINAL_SIZE.swap(size_key, Ordering::Relaxed);
+    if previous_size != 0 && previous_size != size_key {
+        // CSI J at the end of a normal frame only clears *below* the final
+        // cursor. It cannot erase stale right-hand tails on rows already
+        // redrawn at a smaller width. A full clear on geometry changes removes
+        // those tails before the new frame is painted.
+        frame.push_str("\x1b[2J");
+    }
     frame.push_str("\x1b[H");
 
-    if width < 64 || height < 27 {
+    if width < 64 || height < 24 {
         let message = format!(
-            "nost  resize terminal ({}x{}, need >= 65x27)",
+            "nost  resize terminal ({}x{}, need >= 65x24)",
             terminal_width, terminal_height
         );
         let message = truncate(&message, width.saturating_sub(1));
@@ -168,15 +193,18 @@ pub fn render(
             frame.push_str(&message);
         }
         frame.push_str("\x1b[J");
+        frame.push_str(SYNC_END);
         return flush_frame(frame);
     }
 
     // Keep enough room for the two lower boxes even when several GPUs exist.
-    // GPU panel: top + 2 meters + 4-row GPU history + 4-row MEM history +
-    // 4 metric rows + bottom = 16 physical lines. The third box is a direct
+    // GPU panel: top + 4-row GPU history + 4-row MEM history +
+    // 3 metric rows + bottom = 13 physical lines. The current utilization
+    // values live on the graph rows instead of separate meter rows.
+    // The third box is a direct
     // /dev/nvidia-uvm ownership view for processes that can retain CUDA/UVM
     // state without showing attributable VRAM in NVML's process table.
-    let gpu_panel_lines = 16usize;
+    let gpu_panel_lines = 13usize;
     let process_min_lines = 5usize;
     let holders_min_lines = 6usize;
     let fixed_lines = process_min_lines + holders_min_lines;
@@ -230,7 +258,12 @@ pub fn render(
     }
 
     frame.push_str("\x1b[J");
+    frame.push_str(SYNC_END);
     flush_frame(frame)
+}
+
+fn terminal_size_key(width: u16, height: u16) -> u32 {
+    ((width as u32) << 16) | height as u32
 }
 
 fn flush_frame(frame: String) -> io::Result<()> {
@@ -262,55 +295,78 @@ fn push_gpu_panel(
     push_panel_top(frame, &title_plain, &title_styled, width, color, truecolor);
 
     let inner = width.saturating_sub(2);
-    let bar_width = ((inner * 44) / 100).clamp(18, 42);
 
-    let gpu_bar = graded_bar(gpu.gpu_util as f64, bar_width, Grade::Heat, color, truecolor);
-    let mem_bar = graded_bar(gpu.memory_percent(), bar_width, Grade::Memory, color, truecolor);
-
-    let gpu_left = if color {
-        format!(
-            " GPU  {gpu_bar}  {}{:>3}%{RESET}",
-            maybe_grade(gpu.gpu_util as f64, Grade::Heat, color, truecolor),
-            gpu.gpu_util
-        )
-    } else {
-        format!(" GPU  {gpu_bar}  {:>3}%", gpu.gpu_util)
-    };
+    // Current readings live inside the history graph area instead of in
+    // separate meter rows. Keep each reading on its own graph row so the graph
+    // stays wide and the values are easier to scan vertically.
+    let gpu_percent_plain = format!("{}%", gpu.gpu_util);
     let temp_plain = gpu
         .temperature_c
         .map(|v| format!("{v}°C"))
         .unwrap_or_else(|| "--".into());
-    let temp_styled = gpu.temperature_c.map_or_else(
-        || style("--", MUTED, color, truecolor),
-        |v| {
+    let gpu_value_plain = vec![gpu_percent_plain.clone(), temp_plain.clone()];
+    let gpu_value_styled = if color {
+        vec![
             style(
-                &format!("{v}°C"),
-                grade_rgb(temperature_grade(gpu), Grade::Heat),
+                &gpu_percent_plain,
+                grade_rgb(gpu.gpu_util as f64, Grade::Heat),
                 color,
                 truecolor,
-            )
-        },
-    );
-    push_panel_lr(frame, &gpu_left, &temp_plain, &temp_styled, inner, color, truecolor);
-
-    let mem_left = if color {
-        format!(
-            " MEM  {mem_bar}  {}{:>3.0}%{RESET}",
-            maybe_grade(gpu.memory_percent(), Grade::Memory, color, truecolor),
-            gpu.memory_percent()
-        )
+            ),
+            gpu.temperature_c.map_or_else(
+                || style("--", MUTED, color, truecolor),
+                |v| {
+                    style(
+                        &format!("{v}°C"),
+                        grade_rgb(temperature_grade(gpu), Grade::Heat),
+                        color,
+                        truecolor,
+                    )
+                },
+            ),
+        ]
     } else {
-        format!(" MEM  {mem_bar}  {:>3.0}%", gpu.memory_percent())
+        gpu_value_plain.clone()
     };
-    let mem_plain = format_memory_pair_pretty(gpu.memory_used, gpu.memory_total);
-    let mem_styled = style(&mem_plain, CYAN, color, truecolor);
-    push_panel_lr(frame, &mem_left, &mem_plain, &mem_styled, inner, color, truecolor);
+
+    let mem_percent = gpu.memory_percent();
+    let mem_percent_plain = format!("{:.0}%", mem_percent);
+    let mem_used_plain = format_memory_pretty(gpu.memory_used);
+    let mem_total_plain = format_memory_pretty(gpu.memory_total);
+    let mem_value_plain = vec![
+        mem_percent_plain.clone(),
+        mem_used_plain.clone(),
+        mem_total_plain.clone(),
+    ];
+    let mem_value_styled = if color {
+        vec![
+            style(
+                &mem_percent_plain,
+                grade_rgb(mem_percent, Grade::Memory),
+                color,
+                truecolor,
+            ),
+            style(&mem_used_plain, CYAN, color, truecolor),
+            style(&mem_total_plain, MUTED, color, truecolor),
+        ]
+    } else {
+        mem_value_plain.clone()
+    };
 
     // History graphs are vertically graded like btop: color is tied to the
     // utilization row (low rows cool, high rows hot), not to each time column.
-    // This makes a spike climb through green/yellow/orange/red bands instead of
-    // painting the whole spike a single severity color.
-    let graph_width = inner.saturating_sub(8).max(12);
+    // Reserve equal right-side space for both graphs so their timelines stay
+    // perfectly aligned. Because values are stacked vertically, reserve only
+    // the width of the longest individual value, not the whole status string.
+    let status_width = gpu_value_plain
+        .iter()
+        .chain(mem_value_plain.iter())
+        .map(|value| value.chars().count())
+        .max()
+        .unwrap_or(0);
+    let graph_width = inner
+        .saturating_sub(6 + status_width + 2)
+        .max(12);
     push_history_graph(
         frame,
         "gpu",
@@ -318,6 +374,8 @@ fn push_gpu_panel(
         graph_width,
         4,
         Grade::Heat,
+        &gpu_value_plain,
+        &gpu_value_styled,
         inner,
         color,
         truecolor,
@@ -329,20 +387,13 @@ fn push_gpu_panel(
         graph_width,
         4,
         Grade::Memory,
+        &mem_value_plain,
+        &mem_value_styled,
         inner,
         color,
         truecolor,
     );
 
-    let temp_metric = metric(
-        "temperature",
-        &temp_plain,
-        gpu.temperature_c
-            .map(|_| grade_rgb(temperature_grade(gpu), Grade::Heat))
-            .unwrap_or(MUTED),
-        color,
-        truecolor,
-    );
     let power_plain = match (gpu.power_mw, gpu.power_limit_mw) {
         (Some(now), Some(limit)) => format!("{:.0}W / {:.0}W", now as f64 / 1000.0, limit as f64 / 1000.0),
         (Some(now), None) => format!("{:.0}W", now as f64 / 1000.0),
@@ -364,7 +415,15 @@ fn push_gpu_panel(
         .map(|v| format!("{v}%"))
         .unwrap_or_else(|| "--".into());
     let fan_metric = metric("fan", &fan_plain, BLUE, color, truecolor);
-    push_panel_columns(frame, &[temp_metric, power_metric, fan_metric], inner, color, truecolor);
+    let thermal_plain = format_temperature_thresholds(gpu);
+    let thermal_metric = metric(
+        "thermal",
+        &thermal_plain,
+        temperature_limit_color(gpu),
+        color,
+        truecolor,
+    );
+    push_panel_columns(frame, &[power_metric, fan_metric, thermal_metric], inner, color, truecolor);
 
     let core_plain = gpu
         .graphics_clock_mhz
@@ -374,12 +433,8 @@ fn push_gpu_panel(
         .memory_clock_mhz
         .map(|v| format!("{v} MHz"))
         .unwrap_or_else(|| "--".into());
-    let vram_plain = format_memory_pair_compact(gpu.memory_used, gpu.memory_total);
     let core_metric = metric("core clock", &core_plain, TEXT, color, truecolor);
     let memory_metric = metric("mem clock", &memory_clock_plain, TEXT, color, truecolor);
-    let vram_metric = metric("vram", &vram_plain, CYAN, color, truecolor);
-    push_panel_columns(frame, &[core_metric, memory_metric, vram_metric], inner, color, truecolor);
-
     let limit_plain = gpu.clock_limit.as_deref().unwrap_or("--");
     let limit_display = truncate(limit_plain, 12);
     let limit_metric = metric(
@@ -389,33 +444,21 @@ fn push_gpu_panel(
         color,
         truecolor,
     );
+    push_panel_columns(frame, &[core_metric, memory_metric, limit_metric], inner, color, truecolor);
+
     let video_metric = video_metric(
         gpu.encoder_util_percent,
         gpu.decoder_util_percent,
         color,
         truecolor,
     );
-    let thermal_plain = format_temperature_thresholds(gpu);
-    let thermal_metric = metric("thermal", &thermal_plain, temperature_limit_color(gpu), color, truecolor);
-    push_panel_columns(frame, &[limit_metric, video_metric, thermal_metric], inner, color, truecolor);
-
-    let pcie_current = format_pcie_link(gpu.pcie_current_gen, gpu.pcie_current_width);
-    let pcie_max = format_pcie_link(gpu.pcie_max_gen, gpu.pcie_max_width);
-    let pcie_plain = if pcie_current == "--" && pcie_max == "--" {
-        "--".to_string()
-    } else if pcie_max == "--" {
-        pcie_current
-    } else {
-        format!("{pcie_current} / {pcie_max}")
-    };
-    let pcie_metric = metric("pcie", &pcie_plain, BLUE, color, truecolor);
     let traffic_metric = traffic_metric(
         gpu.pcie_tx_kb_per_s,
         gpu.pcie_rx_kb_per_s,
         color,
         truecolor,
     );
-    push_panel_columns(frame, &[pcie_metric, traffic_metric], inner, color, truecolor);
+    push_panel_columns(frame, &[video_metric, traffic_metric], inner, color, truecolor);
 
     push_panel_bottom(frame, width, color, truecolor);
 }
@@ -504,15 +547,6 @@ fn format_temperature_thresholds(gpu: &GpuSnapshot) -> String {
     }
 }
 
-fn format_pcie_link(generation: Option<u32>, width: Option<u32>) -> String {
-    match (generation.filter(|v| *v > 0), width.filter(|v| *v > 0)) {
-        (Some(generation), Some(width)) => format!("Gen{generation} x{width}"),
-        (Some(generation), None) => format!("Gen{generation}"),
-        (None, Some(width)) => format!("x{width}"),
-        (None, None) => "--".to_string(),
-    }
-}
-
 fn format_pcie_rate(kb_per_s: u32) -> String {
     let value = kb_per_s as f64;
     if value >= 1_000_000.0 {
@@ -522,12 +556,6 @@ fn format_pcie_rate(kb_per_s: u32) -> String {
     } else {
         format!("{kb_per_s} KB/s")
     }
-}
-
-fn format_pcie_traffic(tx: Option<u32>, rx: Option<u32>) -> String {
-    let tx = tx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
-    let rx = rx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
-    format!("TX {tx}  RX {rx}")
 }
 
 fn traffic_metric(
@@ -1016,30 +1044,6 @@ fn push_plain_line(
     }
 }
 
-fn graded_bar(percent: f64, width: usize, grade: Grade, color: bool, truecolor: bool) -> String {
-    let percent = percent.clamp(0.0, 100.0);
-    let full = ((percent / 100.0) * width as f64).round() as usize;
-    if !color {
-        return format!(
-            "{}{}",
-            "━".repeat(full.min(width)),
-            "─".repeat(width.saturating_sub(full))
-        );
-    }
-
-    let mut output = String::with_capacity(width * 4 + 64);
-    if full > 0 {
-        output.push_str(&fg(grade_rgb(percent, grade), truecolor));
-        output.push_str(&"━".repeat(full.min(width)));
-    }
-    if full < width {
-        output.push_str(&fg(EMPTY, truecolor));
-        output.push_str(&"─".repeat(width - full));
-    }
-    output.push_str(RESET);
-    output
-}
-
 fn push_history_graph(
     frame: &mut String,
     label: &str,
@@ -1047,6 +1051,8 @@ fn push_history_graph(
     width: usize,
     rows: usize,
     grade: Grade,
+    value_plain: &[String],
+    value_styled: &[String],
     inner: usize,
     color: bool,
     truecolor: bool,
@@ -1055,8 +1061,8 @@ fn push_history_graph(
     let rendered = history_graph_rows(values, width, rows, grade, color, truecolor);
 
     for (screen_row, graph_row) in rendered.into_iter().enumerate() {
-        // Only the top line needs the label; keeping the remaining left margin
-        // blank makes the vertical severity bands visually continuous.
+        // Keep the graph label on the first row, but allow current readings to
+        // occupy multiple rows at the right edge of the graph.
         let prefix = if screen_row == 0 {
             if color {
                 format!(" {}{label}{RESET}  ", fg(MUTED, truecolor))
@@ -1067,7 +1073,18 @@ fn push_history_graph(
             "      ".to_string()
         };
         let line = format!("{prefix}{graph_row}");
-        push_panel_line(frame, &line, inner, color, truecolor);
+        match (value_plain.get(screen_row), value_styled.get(screen_row)) {
+            (Some(plain), Some(styled)) => push_panel_lr(
+                frame,
+                &line,
+                plain,
+                styled,
+                inner,
+                color,
+                truecolor,
+            ),
+            _ => push_panel_line(frame, &line, inner, color, truecolor),
+        }
     }
 }
 
@@ -1121,14 +1138,6 @@ fn history_graph_rows(
     }
 
     output
-}
-
-fn maybe_grade(value: f64, grade: Grade, color: bool, truecolor: bool) -> String {
-    if color {
-        fg(grade_rgb(value, grade), truecolor)
-    } else {
-        String::new()
-    }
 }
 
 fn grade_rgb(value: f64, grade: Grade) -> Rgb {
@@ -1198,24 +1207,6 @@ fn format_memory_pretty(bytes: u64) -> String {
     } else {
         format!("{:.0} MiB", bytes as f64 / MIB)
     }
-}
-
-fn format_memory_pair_pretty(used: u64, total: u64) -> String {
-    format!("{} / {}", format_memory_pretty(used), format_memory_pretty(total))
-}
-
-fn format_memory_compact(bytes: u64) -> String {
-    const MIB: f64 = 1024.0 * 1024.0;
-    const GIB: f64 = 1024.0 * MIB;
-    if bytes as f64 >= GIB {
-        format!("{:.1}G", bytes as f64 / GIB)
-    } else {
-        format!("{:.0}M", bytes as f64 / MIB)
-    }
-}
-
-fn format_memory_pair_compact(used: u64, total: u64) -> String {
-    format!("{}/{}", format_memory_compact(used), format_memory_compact(total))
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -1294,15 +1285,10 @@ pub fn should_use_color(force_no_color: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_memory_pretty, format_pcie_link, format_pcie_rate, format_pcie_traffic, grade_rgb,
-        graded_bar, history_graph_rows, truncate, visible_len_ansi, Grade,
+        format_memory_pretty, format_pcie_rate, grade_rgb, history_graph_rows,
+        terminal_size_key, truncate, visible_len_ansi, Grade,
     };
     use std::collections::VecDeque;
-
-    #[test]
-    fn bar_has_requested_width_without_color() {
-        assert_eq!(graded_bar(50.0, 10, Grade::Heat, false, false).chars().count(), 10);
-    }
 
     #[test]
     fn history_graph_has_requested_rows_and_width() {
@@ -1335,6 +1321,14 @@ mod tests {
     }
 
     #[test]
+    fn terminal_size_key_changes_with_either_dimension() {
+        let base = terminal_size_key(120, 40);
+        assert_ne!(base, terminal_size_key(119, 40));
+        assert_ne!(base, terminal_size_key(120, 39));
+        assert_eq!(base, terminal_size_key(120, 40));
+    }
+
+    #[test]
     fn ansi_width_ignores_control_sequences() {
         assert_eq!(visible_len_ansi("\x1b[38;2;1;2;3mhello\x1b[0m"), 5);
     }
@@ -1347,13 +1341,8 @@ mod tests {
     }
 
     #[test]
-    fn pcie_link_and_traffic_format_are_compact_and_explicit() {
-        assert_eq!(format_pcie_link(Some(4), Some(16)), "Gen4 x16");
+    fn pcie_rate_format_is_compact_and_explicit() {
         assert_eq!(format_pcie_rate(185_000), "185 MB/s");
         assert_eq!(format_pcie_rate(1_250_000), "1.2 GB/s");
-        assert_eq!(
-            format_pcie_traffic(Some(185_000), Some(460_000)),
-            "TX 185 MB/s  RX 460 MB/s"
-        );
     }
 }

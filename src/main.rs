@@ -18,9 +18,11 @@ use std::time::{Duration, Instant};
 use ui::{History, TerminalGuard};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
 
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
+const SIGWINCH: c_int = 28;
 
 extern "C" {
     #[link_name = "signal"]
@@ -29,6 +31,12 @@ extern "C" {
 
 extern "C" fn stop_signal(_signal: c_int) {
     RUNNING.store(false, Ordering::Relaxed);
+}
+
+extern "C" fn resize_signal(_signal: c_int) {
+    // Do not perform terminal I/O from a signal handler. The render loop polls
+    // this flag and redraws within at most one short sleep slice.
+    RESIZE_PENDING.store(true, Ordering::Relaxed);
 }
 
 #[derive(Debug)]
@@ -109,6 +117,10 @@ where
     F: FnMut() -> model::Snapshot,
 {
     while RUNNING.load(Ordering::Relaxed) {
+        // Consume the resize wake-up that brought us here. A new SIGWINCH that
+        // arrives during collection/rendering will set the flag again and keep
+        // us from sleeping after this frame.
+        RESIZE_PENDING.store(false, Ordering::Relaxed);
         let frame_started = Instant::now();
         let snapshot = collect();
         history.update(&snapshot);
@@ -125,6 +137,10 @@ where
             break;
         }
 
+        // The UI itself detects changed terminal geometry and performs the
+        // hard clear. If SIGWINCH arrived during this frame, sleep_interruptible
+        // sees the still-set flag and immediately starts another frame.
+
         let elapsed = frame_started.elapsed();
         if elapsed < config.interval {
             sleep_interruptible(config.interval - elapsed);
@@ -136,19 +152,26 @@ where
 fn sleep_interruptible(duration: Duration) {
     let deadline = Instant::now() + duration;
     while RUNNING.load(Ordering::Relaxed) {
+        if RESIZE_PENDING.load(Ordering::Relaxed) {
+            break;
+        }
         let now = Instant::now();
         if now >= deadline {
             break;
         }
-        thread::sleep((deadline - now).min(Duration::from_millis(50)));
+        // Short slices make resize redraws responsive even if the platform's
+        // sleep implementation restarts after SIGWINCH.
+        thread::sleep((deadline - now).min(Duration::from_millis(40)));
     }
 }
 
 fn install_signal_handlers() {
     unsafe {
-        let handler = stop_signal as usize;
+        let handler = stop_signal as *const () as usize;
+        let resize_handler = resize_signal as *const () as usize;
         let _ = c_signal(SIGINT, handler);
         let _ = c_signal(SIGTERM, handler);
+        let _ = c_signal(SIGWINCH, resize_handler);
     }
 }
 
