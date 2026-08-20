@@ -15,6 +15,33 @@ const NVML_TEMPERATURE_GPU: u32 = 0;
 const NVML_CLOCK_GRAPHICS: u32 = 0;
 const NVML_CLOCK_MEM: u32 = 2;
 
+const NVML_TEMPERATURE_THRESHOLD_SHUTDOWN: u32 = 0;
+const NVML_TEMPERATURE_THRESHOLD_SLOWDOWN: u32 = 1;
+const NVML_TEMPERATURE_THRESHOLD_GPU_MAX: u32 = 3;
+
+const NVML_PCIE_UTIL_TX_BYTES: u32 = 0;
+const NVML_PCIE_UTIL_RX_BYTES: u32 = 1;
+
+const NVML_CLOCK_EVENT_REASON_GPU_IDLE: u64 = 0x0000_0000_0000_0001;
+const NVML_CLOCK_EVENT_REASON_APPLICATION_CLOCKS: u64 = 0x0000_0000_0000_0002;
+const NVML_CLOCK_EVENT_REASON_SW_POWER_CAP: u64 = 0x0000_0000_0000_0004;
+const NVML_CLOCK_EVENT_REASON_HW_SLOWDOWN: u64 = 0x0000_0000_0000_0008;
+const NVML_CLOCK_EVENT_REASON_SYNC_BOOST: u64 = 0x0000_0000_0000_0010;
+const NVML_CLOCK_EVENT_REASON_SW_THERMAL: u64 = 0x0000_0000_0000_0020;
+const NVML_CLOCK_EVENT_REASON_HW_THERMAL: u64 = 0x0000_0000_0000_0040;
+const NVML_CLOCK_EVENT_REASON_HW_POWER_BRAKE: u64 = 0x0000_0000_0000_0080;
+const NVML_CLOCK_EVENT_REASON_DISPLAY_CLOCK: u64 = 0x0000_0000_0000_0100;
+const NVML_CLOCK_EVENT_REASON_KNOWN: u64 =
+    NVML_CLOCK_EVENT_REASON_GPU_IDLE
+        | NVML_CLOCK_EVENT_REASON_APPLICATION_CLOCKS
+        | NVML_CLOCK_EVENT_REASON_SW_POWER_CAP
+        | NVML_CLOCK_EVENT_REASON_HW_SLOWDOWN
+        | NVML_CLOCK_EVENT_REASON_SYNC_BOOST
+        | NVML_CLOCK_EVENT_REASON_SW_THERMAL
+        | NVML_CLOCK_EVENT_REASON_HW_THERMAL
+        | NVML_CLOCK_EVENT_REASON_HW_POWER_BRAKE
+        | NVML_CLOCK_EVENT_REASON_DISPLAY_CLOCK;
+
 const RTLD_NOW: c_int = 2;
 const RTLD_LOCAL: c_int = 0;
 
@@ -64,9 +91,13 @@ type GetNameFn = unsafe extern "C" fn(NvmlDevice, *mut c_char, u32) -> NvmlRetur
 type GetUtilizationFn = unsafe extern "C" fn(NvmlDevice, *mut NvmlUtilization) -> NvmlReturn;
 type GetMemoryFn = unsafe extern "C" fn(NvmlDevice, *mut NvmlMemory) -> NvmlReturn;
 type GetTemperatureFn = unsafe extern "C" fn(NvmlDevice, u32, *mut u32) -> NvmlReturn;
-type GetPowerFn = unsafe extern "C" fn(NvmlDevice, *mut u32) -> NvmlReturn;
+type GetU32Fn = unsafe extern "C" fn(NvmlDevice, *mut u32) -> NvmlReturn;
+type GetU64Fn = unsafe extern "C" fn(NvmlDevice, *mut u64) -> NvmlReturn;
 type GetFanFn = unsafe extern "C" fn(NvmlDevice, *mut u32) -> NvmlReturn;
 type GetClockFn = unsafe extern "C" fn(NvmlDevice, u32, *mut u32) -> NvmlReturn;
+type GetTemperatureThresholdFn = unsafe extern "C" fn(NvmlDevice, u32, *mut u32) -> NvmlReturn;
+type GetVideoUtilizationFn = unsafe extern "C" fn(NvmlDevice, *mut u32, *mut u32) -> NvmlReturn;
+type GetPcieThroughputFn = unsafe extern "C" fn(NvmlDevice, u32, *mut u32) -> NvmlReturn;
 type GetRunningProcessesFn = unsafe extern "C" fn(NvmlDevice, *mut u32, *mut NvmlProcessInfo) -> NvmlReturn;
 type GetProcessUtilizationFn = unsafe extern "C" fn(
     NvmlDevice,
@@ -167,10 +198,19 @@ struct NvmlApi {
     get_utilization: GetUtilizationFn,
     get_memory: GetMemoryFn,
     get_temperature: Option<GetTemperatureFn>,
-    get_power: Option<GetPowerFn>,
-    get_power_limit: Option<GetPowerFn>,
+    get_power: Option<GetU32Fn>,
+    get_power_limit: Option<GetU32Fn>,
     get_fan: Option<GetFanFn>,
     get_clock: Option<GetClockFn>,
+    get_temperature_threshold: Option<GetTemperatureThresholdFn>,
+    get_clock_event_reasons: Option<GetU64Fn>,
+    get_encoder_utilization: Option<GetVideoUtilizationFn>,
+    get_decoder_utilization: Option<GetVideoUtilizationFn>,
+    get_pcie_current_gen: Option<GetU32Fn>,
+    get_pcie_current_width: Option<GetU32Fn>,
+    get_pcie_max_gen: Option<GetU32Fn>,
+    get_pcie_max_width: Option<GetU32Fn>,
+    get_pcie_throughput: Option<GetPcieThroughputFn>,
     get_compute_processes: Option<GetRunningProcessesFn>,
     get_graphics_processes: Option<GetRunningProcessesFn>,
     get_process_utilization: Option<GetProcessUtilizationFn>,
@@ -221,10 +261,51 @@ impl NvmlApi {
             get_utilization: required_symbol!(library, "nvmlDeviceGetUtilizationRates", GetUtilizationFn),
             get_memory: required_symbol!(library, "nvmlDeviceGetMemoryInfo", GetMemoryFn),
             get_temperature: optional_symbol!(library, "nvmlDeviceGetTemperature", GetTemperatureFn),
-            get_power: optional_symbol!(library, "nvmlDeviceGetPowerUsage", GetPowerFn),
-            get_power_limit: optional_symbol!(library, "nvmlDeviceGetPowerManagementLimit", GetPowerFn),
+            get_power: optional_symbol!(library, "nvmlDeviceGetPowerUsage", GetU32Fn),
+            get_power_limit: optional_symbol!(library, "nvmlDeviceGetPowerManagementLimit", GetU32Fn),
             get_fan: optional_symbol!(library, "nvmlDeviceGetFanSpeed", GetFanFn),
             get_clock: optional_symbol!(library, "nvmlDeviceGetClockInfo", GetClockFn),
+            get_temperature_threshold: optional_symbol!(
+                library,
+                "nvmlDeviceGetTemperatureThreshold",
+                GetTemperatureThresholdFn
+            ),
+            get_clock_event_reasons: load_clock_event_reasons_symbol(&library),
+            get_encoder_utilization: optional_symbol!(
+                library,
+                "nvmlDeviceGetEncoderUtilization",
+                GetVideoUtilizationFn
+            ),
+            get_decoder_utilization: optional_symbol!(
+                library,
+                "nvmlDeviceGetDecoderUtilization",
+                GetVideoUtilizationFn
+            ),
+            get_pcie_current_gen: optional_symbol!(
+                library,
+                "nvmlDeviceGetCurrPcieLinkGeneration",
+                GetU32Fn
+            ),
+            get_pcie_current_width: optional_symbol!(
+                library,
+                "nvmlDeviceGetCurrPcieLinkWidth",
+                GetU32Fn
+            ),
+            get_pcie_max_gen: optional_symbol!(
+                library,
+                "nvmlDeviceGetMaxPcieLinkGeneration",
+                GetU32Fn
+            ),
+            get_pcie_max_width: optional_symbol!(
+                library,
+                "nvmlDeviceGetMaxPcieLinkWidth",
+                GetU32Fn
+            ),
+            get_pcie_throughput: optional_symbol!(
+                library,
+                "nvmlDeviceGetPcieThroughput",
+                GetPcieThroughputFn
+            ),
             get_compute_processes,
             get_graphics_processes,
             get_process_utilization: optional_symbol!(library, "nvmlDeviceGetProcessUtilization", GetProcessUtilizationFn),
@@ -250,6 +331,18 @@ impl NvmlApi {
         }
         format!("NVML error {code}")
     }
+}
+
+fn load_clock_event_reasons_symbol(library: &DynamicLibrary) -> Option<GetU64Fn> {
+    for name in [
+        "nvmlDeviceGetCurrentClocksEventReasons",
+        "nvmlDeviceGetCurrentClocksThrottleReasons",
+    ] {
+        if let Some(pointer) = library.symbol_optional(name) {
+            return Some(unsafe { mem::transmute::<*mut c_void, GetU64Fn>(pointer) });
+        }
+    }
+    None
 }
 
 fn load_first_running_process_symbol(
@@ -361,11 +454,43 @@ impl NvmlCollector {
             memory_total: memory.total,
             memory_used: memory.used,
             temperature_c: query_temperature(self.api.get_temperature, device),
+            temperature_slowdown_c: query_temperature_threshold(
+                self.api.get_temperature_threshold,
+                device,
+                NVML_TEMPERATURE_THRESHOLD_SLOWDOWN,
+            ),
+            temperature_shutdown_c: query_temperature_threshold(
+                self.api.get_temperature_threshold,
+                device,
+                NVML_TEMPERATURE_THRESHOLD_SHUTDOWN,
+            ),
+            temperature_max_operating_c: query_temperature_threshold(
+                self.api.get_temperature_threshold,
+                device,
+                NVML_TEMPERATURE_THRESHOLD_GPU_MAX,
+            ),
             power_mw: query_u32(self.api.get_power, device),
             power_limit_mw: query_u32(self.api.get_power_limit, device),
             fan_percent: query_u32(self.api.get_fan, device),
             graphics_clock_mhz: query_clock(self.api.get_clock, device, NVML_CLOCK_GRAPHICS),
             memory_clock_mhz: query_clock(self.api.get_clock, device, NVML_CLOCK_MEM),
+            clock_limit: query_clock_limit(self.api.get_clock_event_reasons, device),
+            encoder_util_percent: query_video_utilization(self.api.get_encoder_utilization, device),
+            decoder_util_percent: query_video_utilization(self.api.get_decoder_utilization, device),
+            pcie_current_gen: query_u32(self.api.get_pcie_current_gen, device),
+            pcie_current_width: query_u32(self.api.get_pcie_current_width, device),
+            pcie_max_gen: query_u32(self.api.get_pcie_max_gen, device),
+            pcie_max_width: query_u32(self.api.get_pcie_max_width, device),
+            pcie_tx_kb_per_s: query_pcie_throughput(
+                self.api.get_pcie_throughput,
+                device,
+                NVML_PCIE_UTIL_TX_BYTES,
+            ),
+            pcie_rx_kb_per_s: query_pcie_throughput(
+                self.api.get_pcie_throughput,
+                device,
+                NVML_PCIE_UTIL_RX_BYTES,
+            ),
         }
     }
 
@@ -449,13 +574,103 @@ fn merge_process(
         .or_insert(ProcessGpuRow { kind, memory });
 }
 
-fn query_u32(function: Option<GetPowerFn>, device: NvmlDevice) -> Option<u32> {
+fn query_u32(function: Option<GetU32Fn>, device: NvmlDevice) -> Option<u32> {
     let function = function?;
     let mut value = 0u32;
     if unsafe { function(device, &mut value) } == NVML_SUCCESS {
         Some(value)
     } else {
         None
+    }
+}
+
+fn query_temperature_threshold(
+    function: Option<GetTemperatureThresholdFn>,
+    device: NvmlDevice,
+    threshold: u32,
+) -> Option<u32> {
+    let function = function?;
+    let mut value = 0u32;
+    if unsafe { function(device, threshold, &mut value) } == NVML_SUCCESS {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn query_video_utilization(
+    function: Option<GetVideoUtilizationFn>,
+    device: NvmlDevice,
+) -> Option<u32> {
+    let function = function?;
+    let mut utilization = 0u32;
+    let mut sampling_period_us = 0u32;
+    if unsafe { function(device, &mut utilization, &mut sampling_period_us) } == NVML_SUCCESS {
+        Some(utilization.min(100))
+    } else {
+        None
+    }
+}
+
+fn query_pcie_throughput(
+    function: Option<GetPcieThroughputFn>,
+    device: NvmlDevice,
+    counter: u32,
+) -> Option<u32> {
+    let function = function?;
+    let mut value = 0u32;
+    if unsafe { function(device, counter, &mut value) } == NVML_SUCCESS {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn query_clock_limit(function: Option<GetU64Fn>, device: NvmlDevice) -> Option<String> {
+    let function = function?;
+    let mut mask = 0u64;
+    if unsafe { function(device, &mut mask) } != NVML_SUCCESS {
+        return None;
+    }
+    Some(format_clock_limit(mask))
+}
+
+fn format_clock_limit(mask: u64) -> String {
+    if mask == 0 {
+        return "none".to_string();
+    }
+
+    let mut reasons = Vec::new();
+    let mut push = |bit: u64, label: &'static str| {
+        if mask & bit != 0 {
+            reasons.push(label);
+        }
+    };
+
+    // Put actionable limiters first. Idle is intentionally last and is only
+    // shown when no actual limiter is active.
+    push(NVML_CLOCK_EVENT_REASON_SW_POWER_CAP, "power");
+    push(NVML_CLOCK_EVENT_REASON_SW_THERMAL, "thermal");
+    push(NVML_CLOCK_EVENT_REASON_HW_THERMAL, "hw thermal");
+    push(NVML_CLOCK_EVENT_REASON_HW_POWER_BRAKE, "power brake");
+    push(NVML_CLOCK_EVENT_REASON_HW_SLOWDOWN, "hw slowdown");
+    push(NVML_CLOCK_EVENT_REASON_SYNC_BOOST, "sync");
+    push(NVML_CLOCK_EVENT_REASON_APPLICATION_CLOCKS, "app clocks");
+    push(NVML_CLOCK_EVENT_REASON_DISPLAY_CLOCK, "display");
+
+    let unknown = mask & !NVML_CLOCK_EVENT_REASON_KNOWN;
+    if unknown != 0 {
+        reasons.push("other");
+    }
+
+    if reasons.is_empty() && mask & NVML_CLOCK_EVENT_REASON_GPU_IDLE != 0 {
+        reasons.push("idle");
+    }
+
+    if reasons.is_empty() {
+        "none".to_string()
+    } else {
+        reasons.join("+")
     }
 }
 
@@ -587,7 +802,7 @@ fn memory_value(value: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NvmlMemory, NvmlProcessInfo, NvmlProcessUtilizationSample, NvmlUtilization};
+    use super::{format_clock_limit, NvmlMemory, NvmlProcessInfo, NvmlProcessUtilizationSample, NvmlUtilization, NVML_CLOCK_EVENT_REASON_GPU_IDLE, NVML_CLOCK_EVENT_REASON_HW_THERMAL, NVML_CLOCK_EVENT_REASON_SW_POWER_CAP};
     use std::mem::{align_of, size_of};
 
     #[test]
@@ -598,5 +813,19 @@ mod tests {
         assert_eq!(size_of::<NvmlProcessUtilizationSample>(), 32);
         assert_eq!(align_of::<NvmlProcessInfo>(), 8);
         assert_eq!(align_of::<NvmlProcessUtilizationSample>(), 8);
+    }
+
+    #[test]
+    fn clock_limit_decoding_prefers_actionable_reasons() {
+        assert_eq!(format_clock_limit(0), "none");
+        assert_eq!(format_clock_limit(NVML_CLOCK_EVENT_REASON_GPU_IDLE), "idle");
+        assert_eq!(
+            format_clock_limit(
+                NVML_CLOCK_EVENT_REASON_GPU_IDLE
+                    | NVML_CLOCK_EVENT_REASON_SW_POWER_CAP
+                    | NVML_CLOCK_EVENT_REASON_HW_THERMAL
+            ),
+            "power+hw thermal"
+        );
     }
 }

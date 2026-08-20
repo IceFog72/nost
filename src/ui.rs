@@ -181,7 +181,7 @@ pub fn render(
     push_header(&mut frame, width, backend_label, interval_ms, snapshot.gpus.len(), color, truecolor);
 
     // Keep enough room for a useful process box even when several GPUs exist.
-    let gpu_panel_lines = 8usize;
+    let gpu_panel_lines = 10usize;
     let process_min_lines = 5usize;
     let fixed_lines = 1 /* header */ + 1 /* gap */ + process_min_lines;
     let max_gpu_panels = height
@@ -314,8 +314,12 @@ fn push_gpu_panel(
     let temp_styled = gpu.temperature_c.map_or_else(
         || style("--", MUTED, color, truecolor),
         |v| {
-            let normalized = ((v as f64 - 30.0) / 60.0 * 100.0).clamp(0.0, 100.0);
-            style(&format!("{v}°C"), grade_rgb(normalized, Grade::Heat), color, truecolor)
+            style(
+                &format!("{v}°C"),
+                grade_rgb(temperature_grade(gpu), Grade::Heat),
+                color,
+                truecolor,
+            )
         },
     );
     push_panel_lr(frame, &gpu_left, &temp_plain, &temp_styled, inner, color, truecolor);
@@ -353,7 +357,7 @@ fn push_gpu_panel(
         "temperature",
         &temp_plain,
         gpu.temperature_c
-            .map(|v| grade_rgb(((v as f64 - 30.0) / 60.0 * 100.0).clamp(0.0, 100.0), Grade::Heat))
+            .map(|_| grade_rgb(temperature_grade(gpu), Grade::Heat))
             .unwrap_or(MUTED),
         color,
         truecolor,
@@ -395,7 +399,133 @@ fn push_gpu_panel(
     let vram_metric = metric("vram", &vram_plain, CYAN, color, truecolor);
     push_panel_columns(frame, &[core_metric, memory_metric, vram_metric], inner, color, truecolor);
 
+    let limit_plain = gpu.clock_limit.as_deref().unwrap_or("--");
+    let limit_display = truncate(limit_plain, 12);
+    let limit_metric = metric(
+        "limit",
+        &limit_display,
+        clock_limit_color(limit_plain),
+        color,
+        truecolor,
+    );
+    let video_plain = format_video_util(gpu.encoder_util_percent, gpu.decoder_util_percent);
+    let video_peak = gpu
+        .encoder_util_percent
+        .into_iter()
+        .chain(gpu.decoder_util_percent)
+        .max()
+        .unwrap_or(0) as f64;
+    let video_metric = metric(
+        "video",
+        &video_plain,
+        grade_rgb(video_peak, Grade::Memory),
+        color,
+        truecolor,
+    );
+    let thermal_plain = format_temperature_thresholds(gpu);
+    let thermal_metric = metric("thermal", &thermal_plain, temperature_limit_color(gpu), color, truecolor);
+    push_panel_columns(frame, &[limit_metric, video_metric, thermal_metric], inner, color, truecolor);
+
+    let pcie_current = format_pcie_link(gpu.pcie_current_gen, gpu.pcie_current_width);
+    let pcie_max = format_pcie_link(gpu.pcie_max_gen, gpu.pcie_max_width);
+    let pcie_plain = if pcie_current == "--" && pcie_max == "--" {
+        "--".to_string()
+    } else if pcie_max == "--" {
+        pcie_current
+    } else {
+        format!("{pcie_current} / {pcie_max}")
+    };
+    let traffic_plain = format_pcie_traffic(gpu.pcie_tx_kb_per_s, gpu.pcie_rx_kb_per_s);
+    let pcie_metric = metric("pcie", &pcie_plain, BLUE, color, truecolor);
+    let traffic_metric = metric("traffic", &traffic_plain, CYAN, color, truecolor);
+    push_panel_columns(frame, &[pcie_metric, traffic_metric], inner, color, truecolor);
+
     push_panel_bottom(frame, width, color, truecolor);
+}
+
+fn temperature_grade(gpu: &GpuSnapshot) -> f64 {
+    let Some(current) = gpu.temperature_c else {
+        return 0.0;
+    };
+    let limit = gpu.temperature_limit_c().unwrap_or(90).max(45);
+    let floor = 30u32.min(limit.saturating_sub(1));
+    let span = limit.saturating_sub(floor).max(1) as f64;
+    ((current.saturating_sub(floor) as f64 / span) * 100.0).clamp(0.0, 100.0)
+}
+
+fn temperature_limit_color(gpu: &GpuSnapshot) -> Rgb {
+    if gpu.temperature_limit_c().is_some() {
+        grade_rgb(72.0, Grade::Heat)
+    } else {
+        MUTED
+    }
+}
+
+fn clock_limit_color(limit: &str) -> Rgb {
+    if limit == "--" {
+        MUTED
+    } else if limit == "none" {
+        ACCENT
+    } else if limit == "idle" {
+        BLUE
+    } else if limit.contains("thermal")
+        || limit.contains("power brake")
+        || limit.contains("hw slowdown")
+    {
+        grade_rgb(95.0, Grade::Heat)
+    } else if limit.contains("power") {
+        grade_rgb(78.0, Grade::Heat)
+    } else {
+        grade_rgb(62.0, Grade::Heat)
+    }
+}
+
+fn format_video_util(encoder: Option<u32>, decoder: Option<u32>) -> String {
+    let enc = encoder
+        .map(|v| format!("{v}%"))
+        .unwrap_or_else(|| "--".to_string());
+    let dec = decoder
+        .map(|v| format!("{v}%"))
+        .unwrap_or_else(|| "--".to_string());
+    format!("ENC{enc} DEC{dec}")
+}
+
+fn format_temperature_thresholds(gpu: &GpuSnapshot) -> String {
+    let operating = gpu
+        .temperature_max_operating_c
+        .or(gpu.temperature_slowdown_c);
+    match (operating, gpu.temperature_shutdown_c) {
+        (Some(limit), Some(shutdown)) if limit != shutdown => format!("{limit}/{shutdown}°C"),
+        (Some(limit), _) => format!("{limit}°C"),
+        (None, Some(shutdown)) => format!("--/{shutdown}°C"),
+        (None, None) => "--".to_string(),
+    }
+}
+
+fn format_pcie_link(generation: Option<u32>, width: Option<u32>) -> String {
+    match (generation.filter(|v| *v > 0), width.filter(|v| *v > 0)) {
+        (Some(generation), Some(width)) => format!("Gen{generation} x{width}"),
+        (Some(generation), None) => format!("Gen{generation}"),
+        (None, Some(width)) => format!("x{width}"),
+        (None, None) => "--".to_string(),
+    }
+}
+
+fn format_pcie_rate(kb_per_s: u32) -> String {
+    let value = kb_per_s as f64;
+    if value >= 1_000_000.0 {
+        format!("{:.1}GB/s", value / 1_000_000.0)
+    } else if value >= 1_000.0 {
+        format!("{:.0}MB/s", value / 1_000.0)
+    } else {
+        format!("{kb_per_s}KB/s")
+    }
+}
+
+fn format_pcie_traffic(tx: Option<u32>, rx: Option<u32>) -> String {
+    let tx = tx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
+    let rx = rx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
+    format!("TX{tx} RX{rx}")
 }
 
 #[derive(Clone)]
@@ -944,8 +1074,8 @@ pub fn should_use_color(force_no_color: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_memory_pretty, grade_rgb, graded_bar, spark_graded, truncate, visible_len_ansi,
-        Grade,
+        format_memory_pretty, format_pcie_link, format_pcie_rate, format_pcie_traffic, grade_rgb,
+        graded_bar, spark_graded, truncate, visible_len_ansi, Grade,
     };
     use std::collections::VecDeque;
 
@@ -982,5 +1112,16 @@ mod tests {
         let cool = grade_rgb(10.0, Grade::Heat);
         let hot = grade_rgb(95.0, Grade::Heat);
         assert!(hot.0 > cool.0);
+    }
+
+    #[test]
+    fn pcie_link_and_traffic_format_are_compact_and_explicit() {
+        assert_eq!(format_pcie_link(Some(4), Some(16)), "Gen4 x16");
+        assert_eq!(format_pcie_rate(185_000), "185MB/s");
+        assert_eq!(format_pcie_rate(1_250_000), "1.2GB/s");
+        assert_eq!(
+            format_pcie_traffic(Some(185_000), Some(460_000)),
+            "TX185MB/s RX460MB/s"
+        );
     }
 }

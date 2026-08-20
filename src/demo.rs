@@ -31,11 +31,23 @@ impl DemoCollector {
             memory_total: total,
             memory_used,
             temperature_c: Some((55.0 + 7.0 * (t * 0.31).sin()).round() as u32),
+            temperature_slowdown_c: Some(87),
+            temperature_shutdown_c: Some(97),
+            temperature_max_operating_c: Some(87),
             power_mw: Some((62_000.0 + 18_000.0 * (t * 0.41).sin()) as u32),
             power_limit_mw: Some(105_000),
             fan_percent: Some(wave(44.0, 12.0, 0.28, 1.0)),
             graphics_clock_mhz: Some((1665.0 + 240.0 * (t * 0.47).sin()) as u32),
             memory_clock_mhz: Some(7001),
+            clock_limit: Some(if gpu_util > 78 { "power" } else { "none" }.to_string()),
+            encoder_util_percent: Some(wave(18.0, 15.0, 0.51, 0.8)),
+            decoder_util_percent: Some(wave(9.0, 8.0, 0.69, 2.1)),
+            pcie_current_gen: Some(4),
+            pcie_current_width: Some(8),
+            pcie_max_gen: Some(4),
+            pcie_max_width: Some(16),
+            pcie_tx_kb_per_s: Some((185_000.0 + 140_000.0 * (t * 0.57).sin()).max(0.0) as u32),
+            pcie_rx_kb_per_s: Some((460_000.0 + 320_000.0 * (t * 0.43 + 1.0).sin()).max(0.0) as u32),
         }];
 
         let mut processes = vec![

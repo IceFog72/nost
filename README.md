@@ -29,10 +29,14 @@ For the real monitor:
 
 - GPU utilization
 - framebuffer/VRAM total + used
-- temperature
+- GPU temperature plus supported slowdown / maximum-operating / shutdown thresholds
 - power draw + power limit
 - fan speed
 - graphics and memory clocks
+- active clock-event / performance-limit reasons (power, thermal, hardware slowdown, idle, etc.)
+- NVENC encoder and NVDEC decoder utilization
+- current and maximum PCIe link generation + width
+- PCIe TX/RX throughput
 - compute and graphics process PIDs
 - per-process framebuffer memory
 - per-process SM utilization when `nvmlDeviceGetProcessUtilization` is supported; sample timestamps are advanced between refreshes so old non-zero utilization is not held forever
@@ -52,7 +56,9 @@ The renderer is intentionally small and dependency-free, but the visual hierarch
 - three-column thermals/power/fan and clocks/VRAM rows
 - per-sample color grading: cool/green at low load, amber in the middle, coral/red at high load
 - a separate cyan/teal VRAM grade that also turns amber/red near saturation
+- temperature is graded against NVML-reported hardware limits when the GPU exposes them, instead of fixed generic thresholds
 - temperature, power and per-process GPU percentages use the same severity grades
+- compact `limit`, `ENC`/`DEC`, hardware thermal-limit, PCIe link and PCIe TX/RX rows
 - 24-bit color when the terminal advertises truecolor, with an automatic ANSI-256 fallback
 
 No TUI framework is required: the app still writes a single ANSI frame directly and never registers keyboard or mouse input.
@@ -94,7 +100,9 @@ NVIDIA driver
              │
              ▼
       Rust NVML FFI loader
-       ├── device metrics
+       ├── device metrics + thermal limits
+       ├── clock-event reasons + video engines
+       ├── PCIe link + TX/RX traffic
        ├── running processes
        └── process utilization
              │

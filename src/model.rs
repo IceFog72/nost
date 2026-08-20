@@ -6,11 +6,23 @@ pub struct GpuSnapshot {
     pub memory_total: u64,
     pub memory_used: u64,
     pub temperature_c: Option<u32>,
+    pub temperature_slowdown_c: Option<u32>,
+    pub temperature_shutdown_c: Option<u32>,
+    pub temperature_max_operating_c: Option<u32>,
     pub power_mw: Option<u32>,
     pub power_limit_mw: Option<u32>,
     pub fan_percent: Option<u32>,
     pub graphics_clock_mhz: Option<u32>,
     pub memory_clock_mhz: Option<u32>,
+    pub clock_limit: Option<String>,
+    pub encoder_util_percent: Option<u32>,
+    pub decoder_util_percent: Option<u32>,
+    pub pcie_current_gen: Option<u32>,
+    pub pcie_current_width: Option<u32>,
+    pub pcie_max_gen: Option<u32>,
+    pub pcie_max_width: Option<u32>,
+    pub pcie_tx_kb_per_s: Option<u32>,
+    pub pcie_rx_kb_per_s: Option<u32>,
 }
 
 impl GpuSnapshot {
@@ -20,6 +32,12 @@ impl GpuSnapshot {
         } else {
             (self.memory_used as f64 * 100.0 / self.memory_total as f64).clamp(0.0, 100.0)
         }
+    }
+
+    pub fn temperature_limit_c(&self) -> Option<u32> {
+        self.temperature_max_operating_c
+            .or(self.temperature_slowdown_c)
+            .or(self.temperature_shutdown_c)
     }
 }
 

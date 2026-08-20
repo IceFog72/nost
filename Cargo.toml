@@ -1,6 +1,6 @@
 [package]
 name = "nost"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 description = "Minimal btop-style direct-NVML NVIDIA GPU monitor"
 license = "MIT"
