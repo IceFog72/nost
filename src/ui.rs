@@ -146,6 +146,33 @@ fn push_bounded(values: &mut VecDeque<f64>, value: f64, max_len: usize) {
     values.push_back(value);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VerticalLayout {
+    graph_rows: usize,
+    show_holders: bool,
+}
+
+fn choose_vertical_layout(height: usize) -> Option<VerticalLayout> {
+    // Priority under height pressure:
+    //   1) keep one GPU panel visible,
+    //   2) keep at least the top three process rows visible,
+    //   3) keep the VRAM-holder box when there is room,
+    //   4) spend remaining height on the 4-row history graphs.
+    //
+    // Compact GPU panel = top + 1 GPU graph + 1 MEM graph + 3 metric rows + bottom = 7.
+    // Process panel minimum = top + header + 3 process rows + bottom = 6.
+    if height < 13 {
+        return None;
+    }
+    if height < 18 {
+        return Some(VerticalLayout { graph_rows: 1, show_holders: false });
+    }
+    if height < 24 {
+        return Some(VerticalLayout { graph_rows: 1, show_holders: true });
+    }
+    Some(VerticalLayout { graph_rows: 4, show_holders: true })
+}
+
 pub fn render(
     snapshot: &Snapshot,
     history: &History,
@@ -177,9 +204,10 @@ pub fn render(
     }
     frame.push_str("\x1b[H");
 
-    if width < 64 || height < 24 {
+    let vertical_layout = choose_vertical_layout(height);
+    if width < 64 || vertical_layout.is_none() {
         let message = format!(
-            "nost  resize terminal ({}x{}, need >= 65x24)",
+            "nost  resize terminal ({}x{}, need >= 65x13)",
             terminal_width, terminal_height
         );
         let message = truncate(&message, width.saturating_sub(1));
@@ -197,16 +225,15 @@ pub fn render(
         return flush_frame(frame);
     }
 
-    // Keep enough room for the two lower boxes even when several GPUs exist.
-    // GPU panel: top + 4-row GPU history + 4-row MEM history +
-    // 3 metric rows + bottom = 13 physical lines. The current utilization
-    // values live on the graph rows instead of separate meter rows.
-    // The third box is a direct
-    // /dev/nvidia-uvm ownership view for processes that can retain CUDA/UVM
-    // state without showing attributable VRAM in NVML's process table.
-    let gpu_panel_lines = 13usize;
-    let process_min_lines = 5usize;
-    let holders_min_lines = 6usize;
+    let vertical_layout = vertical_layout.expect("height checked above");
+    // GPU panel lines are: top + GPU graph + MEM graph + 3 metric rows + bottom.
+    // Full graphs use four rows each (13 total); compact graphs use one row each
+    // (7 total). Process visibility is a hard priority: reserve six lines so
+    // the top three process rows never disappear merely because the window got
+    // shorter. The optional holders box gets five lines when it fits.
+    let gpu_panel_lines = 5usize + vertical_layout.graph_rows * 2;
+    let process_min_lines = 6usize;
+    let holders_min_lines = if vertical_layout.show_holders { 5usize } else { 0usize };
     let fixed_lines = process_min_lines + holders_min_lines;
     let max_gpu_panels = height
         .saturating_sub(fixed_lines)
@@ -215,46 +242,61 @@ pub fn render(
         .max(1);
 
     for gpu in snapshot.gpus.iter().take(max_gpu_panels) {
-        push_gpu_panel(&mut frame, gpu, history, width, color, truecolor);
-    }
-
-    if snapshot.gpus.len() > max_gpu_panels {
-        let hidden = snapshot.gpus.len() - max_gpu_panels;
-        push_plain_line(
+        push_gpu_panel(
             &mut frame,
-            &format!("  … {hidden} more GPU{} hidden", if hidden == 1 { "" } else { "s" }),
+            gpu,
+            history,
             width,
-            MUTED,
+            vertical_layout.graph_rows,
             color,
             truecolor,
         );
+    }
+
+    if snapshot.gpus.len() > max_gpu_panels {
+        // A hidden-GPU notice is informational, so never let it consume one of
+        // the six lines reserved for the top-three process table.
+        let gpu_lines = max_gpu_panels.saturating_mul(gpu_panel_lines);
+        if height >= gpu_lines.saturating_add(fixed_lines).saturating_add(1) {
+            let hidden = snapshot.gpus.len() - max_gpu_panels;
+            push_plain_line(
+                &mut frame,
+                &format!("  … {hidden} more GPU{} hidden", if hidden == 1 { "" } else { "s" }),
+                width,
+                MUTED,
+                color,
+                truecolor,
+            );
+        }
     }
 
     let lines_before_process = count_newlines(&frame);
     let remaining = height.saturating_sub(lines_before_process);
-    let process_budget = remaining.saturating_sub(holders_min_lines);
-    if process_budget >= 4 {
+    let process_budget = remaining.saturating_sub(holders_min_lines).max(process_min_lines);
+    if process_budget >= process_min_lines {
         push_process_panel(
             &mut frame,
             &snapshot.processes,
             width,
-            process_budget,
+            process_budget.min(remaining),
             color,
             truecolor,
         );
     }
 
-    let lines_before_holders = count_newlines(&frame);
-    let holder_budget = height.saturating_sub(lines_before_holders);
-    if holder_budget >= 5 {
-        push_vram_holders_panel(
-            &mut frame,
-            snapshot,
-            width,
-            holder_budget,
-            color,
-            truecolor,
-        );
+    if vertical_layout.show_holders {
+        let lines_before_holders = count_newlines(&frame);
+        let holder_budget = height.saturating_sub(lines_before_holders);
+        if holder_budget >= holders_min_lines {
+            push_vram_holders_panel(
+                &mut frame,
+                snapshot,
+                width,
+                holder_budget,
+                color,
+                truecolor,
+            );
+        }
     }
 
     frame.push_str("\x1b[J");
@@ -277,6 +319,7 @@ fn push_gpu_panel(
     gpu: &GpuSnapshot,
     history: &History,
     width: usize,
+    graph_rows: usize,
     color: bool,
     truecolor: bool,
 ) {
@@ -296,68 +339,83 @@ fn push_gpu_panel(
 
     let inner = width.saturating_sub(2);
 
-    // Current readings live inside the history graph area instead of in
-    // separate meter rows. Keep each reading on its own graph row so the graph
-    // stays wide and the values are easier to scan vertically.
+    // Current readings live inside the history graph area instead of separate
+    // meter rows. Full-height mode stacks values vertically at the right edge.
+    // When height pressure collapses each graph to one terminal row, combine
+    // the readings on that single row so no important live value disappears.
     let gpu_percent_plain = format!("{}%", gpu.gpu_util);
     let temp_plain = gpu
         .temperature_c
         .map(|v| format!("{v}°C"))
         .unwrap_or_else(|| "--".into());
-    let gpu_value_plain = vec![gpu_percent_plain.clone(), temp_plain.clone()];
-    let gpu_value_styled = if color {
-        vec![
-            style(
-                &gpu_percent_plain,
-                grade_rgb(gpu.gpu_util as f64, Grade::Heat),
-                color,
-                truecolor,
-            ),
-            gpu.temperature_c.map_or_else(
-                || style("--", MUTED, color, truecolor),
-                |v| {
-                    style(
-                        &format!("{v}°C"),
-                        grade_rgb(temperature_grade(gpu), Grade::Heat),
-                        color,
-                        truecolor,
-                    )
-                },
-            ),
-        ]
+    let gpu_percent_styled = if color {
+        style(
+            &gpu_percent_plain,
+            grade_rgb(gpu.gpu_util as f64, Grade::Heat),
+            color,
+            truecolor,
+        )
     } else {
-        gpu_value_plain.clone()
+        gpu_percent_plain.clone()
+    };
+    let temp_styled = if color {
+        gpu.temperature_c.map_or_else(
+            || style("--", MUTED, color, truecolor),
+            |v| {
+                style(
+                    &format!("{v}°C"),
+                    grade_rgb(temperature_grade(gpu), Grade::Heat),
+                    color,
+                    truecolor,
+                )
+            },
+        )
+    } else {
+        temp_plain.clone()
     };
 
     let mem_percent = gpu.memory_percent();
     let mem_percent_plain = format!("{:.0}%", mem_percent);
     let mem_used_plain = format_memory_pretty(gpu.memory_used);
     let mem_total_plain = format_memory_pretty(gpu.memory_total);
-    let mem_value_plain = vec![
-        mem_percent_plain.clone(),
-        mem_used_plain.clone(),
-        mem_total_plain.clone(),
-    ];
-    let mem_value_styled = if color {
-        vec![
-            style(
-                &mem_percent_plain,
-                grade_rgb(mem_percent, Grade::Memory),
-                color,
-                truecolor,
-            ),
-            style(&mem_used_plain, CYAN, color, truecolor),
-            style(&mem_total_plain, MUTED, color, truecolor),
-        ]
+    let mem_percent_styled = if color {
+        style(
+            &mem_percent_plain,
+            grade_rgb(mem_percent, Grade::Memory),
+            color,
+            truecolor,
+        )
     } else {
-        mem_value_plain.clone()
+        mem_percent_plain.clone()
     };
+    let mem_used_styled = style(&mem_used_plain, CYAN, color, truecolor);
+    let mem_total_styled = style(&mem_total_plain, MUTED, color, truecolor);
+
+    let (gpu_value_plain, gpu_value_styled, mem_value_plain, mem_value_styled) =
+        if graph_rows <= 1 {
+            (
+                vec![format!("{gpu_percent_plain}  {temp_plain}")],
+                vec![format!("{gpu_percent_styled}  {temp_styled}")],
+                vec![format!("{mem_percent_plain}  {mem_used_plain} / {mem_total_plain}")],
+                vec![format!(
+                    "{mem_percent_styled}  {mem_used_styled} / {mem_total_styled}"
+                )],
+            )
+        } else {
+            (
+                vec![gpu_percent_plain.clone(), temp_plain.clone()],
+                vec![gpu_percent_styled, temp_styled],
+                vec![
+                    mem_percent_plain.clone(),
+                    mem_used_plain.clone(),
+                    mem_total_plain.clone(),
+                ],
+                vec![mem_percent_styled, mem_used_styled, mem_total_styled],
+            )
+        };
 
     // History graphs are vertically graded like btop: color is tied to the
     // utilization row (low rows cool, high rows hot), not to each time column.
-    // Reserve equal right-side space for both graphs so their timelines stay
-    // perfectly aligned. Because values are stacked vertically, reserve only
-    // the width of the longest individual value, not the whole status string.
     let status_width = gpu_value_plain
         .iter()
         .chain(mem_value_plain.iter())
@@ -372,7 +430,7 @@ fn push_gpu_panel(
         "gpu",
         history.gpu(gpu.index),
         graph_width,
-        4,
+        graph_rows,
         Grade::Heat,
         &gpu_value_plain,
         &gpu_value_styled,
@@ -385,7 +443,7 @@ fn push_gpu_panel(
         "mem",
         history.memory(gpu.index),
         graph_width,
-        4,
+        graph_rows,
         Grade::Memory,
         &mem_value_plain,
         &mem_value_styled,
@@ -664,9 +722,12 @@ fn push_process_panel(
     let header = process_header(&columns, color, truecolor);
     push_panel_line(frame, &header, inner, color, truecolor);
 
-    // top + header + bottom consume 3 physical lines.
+    // top + header + bottom consume 3 physical lines. Under height pressure
+    // process rows outrank the "… more" summary: with a 6-line panel we show
+    // three real processes, never two processes plus a summary.
     let rows_available = available_lines.saturating_sub(3);
-    let data_rows = if processes.len() > rows_available && rows_available > 0 {
+    let reserve_summary = processes.len() > rows_available && rows_available >= 4;
+    let data_rows = if reserve_summary {
         rows_available.saturating_sub(1)
     } else {
         rows_available
@@ -1285,8 +1346,8 @@ pub fn should_use_color(force_no_color: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_memory_pretty, format_pcie_rate, grade_rgb, history_graph_rows,
-        terminal_size_key, truncate, visible_len_ansi, Grade,
+        choose_vertical_layout, format_memory_pretty, format_pcie_rate, grade_rgb,
+        history_graph_rows, terminal_size_key, truncate, visible_len_ansi, Grade,
     };
     use std::collections::VecDeque;
 
@@ -1326,6 +1387,23 @@ mod tests {
         assert_ne!(base, terminal_size_key(119, 40));
         assert_ne!(base, terminal_size_key(120, 39));
         assert_eq!(base, terminal_size_key(120, 40));
+    }
+
+
+    #[test]
+    fn height_layout_collapses_graphs_before_process_rows() {
+        assert_eq!(choose_vertical_layout(12), None);
+        let tiny = choose_vertical_layout(13).unwrap();
+        assert_eq!(tiny.graph_rows, 1);
+        assert!(!tiny.show_holders);
+
+        let compact = choose_vertical_layout(18).unwrap();
+        assert_eq!(compact.graph_rows, 1);
+        assert!(compact.show_holders);
+
+        let full = choose_vertical_layout(24).unwrap();
+        assert_eq!(full.graph_rows, 4);
+        assert!(full.show_holders);
     }
 
     #[test]

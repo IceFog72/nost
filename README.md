@@ -190,3 +190,12 @@ wider.
 - Disables DEC auto-wrap while the dashboard is active so a mid-frame shrink clips instead of wrapping.
 - Uses DEC synchronized-output mode (`2026`) when supported to avoid displaying half-painted frames.
 - Restores wrap, cursor, alternate-screen, mouse/scroll and sync modes on exit.
+
+
+## v0.4.13 adaptive height
+
+- When terminal height drops below the full 24-row layout, both utilization histories collapse from four rows to a single graph line instead of replacing the dashboard with a resize warning.
+- Compact graph lines keep their live values inline (`GPU% + temperature`, `MEM% + used/total VRAM`).
+- The process panel has hard priority for at least the top three process rows whenever the dashboard can render at all.
+- From 18–23 rows the VRAM-holder box remains visible with one-line graphs; from 13–17 rows the holder box is temporarily hidden so GPU history + top-three processes stay visible.
+- Minimum supported geometry is now 65x13.
