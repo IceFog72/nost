@@ -1157,8 +1157,10 @@ fn history_graph_rows(
     color: bool,
     truecolor: bool,
 ) -> Vec<String> {
-    // Each terminal row contains 8 vertical sub-levels. A sample therefore has
-    // rows*8 possible heights while the row's color remains fixed horizontally.
+    // Each terminal row contains 8 vertical sub-levels. For multi-row graphs we
+    // keep btop-style row grading: color is tied to height bands. In compact
+    // one-line mode, switch to per-sample/column grading so the single row still
+    // carries a sense of intensity.
     const BLOCKS: [char; 9] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
     let rows = rows.max(1);
@@ -1171,6 +1173,22 @@ fn history_graph_rows(
         }
         None => vec![0.0; width],
     };
+
+    if rows == 1 {
+        let mut line = String::with_capacity(width * 10 + 32);
+        for value in &visible {
+            let level = ((*value / 100.0) * 8.0).round() as usize;
+            let ch = BLOCKS[level.min(8)];
+            if color {
+                line.push_str(&fg(grade_rgb(*value, grade), truecolor));
+                line.push(ch);
+                line.push_str(RESET);
+            } else {
+                line.push(ch);
+            }
+        }
+        return vec![line];
+    }
 
     let mut output = Vec::with_capacity(rows);
     for screen_row in 0..rows {
@@ -1368,6 +1386,17 @@ mod tests {
         for row in output {
             assert_eq!(row.matches("\x1b[38;").count(), 1);
         }
+    }
+
+    #[test]
+    fn compact_history_graph_colors_are_column_based() {
+        let values = VecDeque::from(vec![10.0, 55.0, 90.0, 100.0]);
+        let output = history_graph_rows(Some(&values), 4, 1, Grade::Heat, true, true);
+        assert_eq!(output.len(), 1);
+        let row = &output[0];
+        // One-line graphs should color each sample independently.
+        assert_eq!(row.matches("\x1b[0m").count(), 4);
+        assert_eq!(row.matches("\x1b[38;").count(), 4);
     }
 
     #[test]

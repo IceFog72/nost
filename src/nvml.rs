@@ -526,17 +526,9 @@ impl NvmlCollector {
             })
             .collect();
         snapshot.vram_holders.sort_by(|a, b| {
-            // Holders with no/zero NVML-attributed VRAM are the most useful
-            // suspects for an unexplained gap, so keep them visible first.
-            let a_hidden = a.nvml_memory_bytes.unwrap_or(0) == 0;
-            let b_hidden = b.nvml_memory_bytes.unwrap_or(0) == 0;
-            b_hidden
-                .cmp(&a_hidden)
-                .then_with(|| {
-                    b.nvml_memory_bytes
-                        .unwrap_or(0)
-                        .cmp(&a.nvml_memory_bytes.unwrap_or(0))
-                })
+            b.nvml_memory_bytes
+                .unwrap_or(0)
+                .cmp(&a.nvml_memory_bytes.unwrap_or(0))
                 .then_with(|| a.pid.cmp(&b.pid))
         });
         snapshot.uvm_module_refcount = self.uvm_probe.module_refcount;

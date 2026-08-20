@@ -108,7 +108,7 @@ impl DemoCollector {
                 .then_with(|| b.memory_bytes.unwrap_or(0).cmp(&a.memory_bytes.unwrap_or(0)))
         });
 
-        let vram_holders = vec![
+        let mut vram_holders = vec![
             VramHolderSnapshot {
                 pid: 14122,
                 name: "llama-server".to_string(),
@@ -124,6 +124,12 @@ impl DemoCollector {
                 gpu_indices: Vec::new(),
             },
         ];
+        vram_holders.sort_by(|a, b| {
+            b.nvml_memory_bytes
+                .unwrap_or(0)
+                .cmp(&a.nvml_memory_bytes.unwrap_or(0))
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
 
         Snapshot {
             gpus,
