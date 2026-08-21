@@ -150,27 +150,41 @@ fn push_bounded(values: &mut VecDeque<f64>, value: f64, max_len: usize) {
 struct VerticalLayout {
     graph_rows: usize,
     show_holders: bool,
+    ultra_compact: bool,
 }
 
 fn choose_vertical_layout(height: usize) -> Option<VerticalLayout> {
-    // Priority under height pressure:
-    //   1) keep one GPU panel visible,
-    //   2) keep at least the top three process rows visible,
-    //   3) keep the VRAM-holder box when there is room,
-    //   4) spend remaining height on the 4-row history graphs.
+    // Hard visibility priorities under height pressure:
+    //   1) one GPU summary remains visible,
+    //   2) at least the top three processes remain visible,
+    //   3) at least the top two VRAM holders remain visible,
+    //   4) secondary GPU metrics and multi-row graphs consume spare height.
     //
-    // Compact GPU panel = top + 1 GPU graph + 1 MEM graph + 3 metric rows + bottom = 7.
-    // Process panel minimum = top + header + 3 process rows + bottom = 6.
+    // Ultra-compact (13 rows): GPU 4 + processes 5 + holders 4 = 13.
+    // Compact (19 rows): GPU 7 + processes 6 + holders 6 = 19.
+    // Full (25 rows): GPU 13 + processes 6 + holders 6 = 25.
     if height < 13 {
         return None;
     }
-    if height < 18 {
-        return Some(VerticalLayout { graph_rows: 1, show_holders: false });
+    if height < 19 {
+        return Some(VerticalLayout {
+            graph_rows: 1,
+            show_holders: true,
+            ultra_compact: true,
+        });
     }
-    if height < 24 {
-        return Some(VerticalLayout { graph_rows: 1, show_holders: true });
+    if height < 25 {
+        return Some(VerticalLayout {
+            graph_rows: 1,
+            show_holders: true,
+            ultra_compact: false,
+        });
     }
-    Some(VerticalLayout { graph_rows: 4, show_holders: true })
+    Some(VerticalLayout {
+        graph_rows: 4,
+        show_holders: true,
+        ultra_compact: false,
+    })
 }
 
 pub fn render(
@@ -226,14 +240,20 @@ pub fn render(
     }
 
     let vertical_layout = vertical_layout.expect("height checked above");
-    // GPU panel lines are: top + GPU graph + MEM graph + 3 metric rows + bottom.
-    // Full graphs use four rows each (13 total); compact graphs use one row each
-    // (7 total). Process visibility is a hard priority: reserve six lines so
-    // the top three process rows never disappear merely because the window got
-    // shorter. The optional holders box gets five lines when it fits.
-    let gpu_panel_lines = 5usize + vertical_layout.graph_rows * 2;
-    let process_min_lines = 6usize;
-    let holders_min_lines = if vertical_layout.show_holders { 5usize } else { 0usize };
+    // At the minimum 13-row geometry, secondary GPU metric rows and table
+    // headers are suppressed so we can preserve 3 process rows + 2 holder rows.
+    // Once 19 rows are available, the normal compact panels and headers return.
+    let gpu_panel_lines = if vertical_layout.ultra_compact {
+        2usize + vertical_layout.graph_rows * 2
+    } else {
+        5usize + vertical_layout.graph_rows * 2
+    };
+    let process_min_lines = if vertical_layout.ultra_compact { 5usize } else { 6usize };
+    let holders_min_lines = if vertical_layout.show_holders {
+        if vertical_layout.ultra_compact { 4usize } else { 6usize }
+    } else {
+        0usize
+    };
     let fixed_lines = process_min_lines + holders_min_lines;
     let max_gpu_panels = height
         .saturating_sub(fixed_lines)
@@ -248,6 +268,7 @@ pub fn render(
             history,
             width,
             vertical_layout.graph_rows,
+            vertical_layout.ultra_compact,
             color,
             truecolor,
         );
@@ -279,6 +300,7 @@ pub fn render(
             &snapshot.processes,
             width,
             process_budget.min(remaining),
+            vertical_layout.ultra_compact,
             color,
             truecolor,
         );
@@ -293,6 +315,7 @@ pub fn render(
                 snapshot,
                 width,
                 holder_budget,
+                vertical_layout.ultra_compact,
                 color,
                 truecolor,
             );
@@ -320,6 +343,7 @@ fn push_gpu_panel(
     history: &History,
     width: usize,
     graph_rows: usize,
+    ultra_compact: bool,
     color: bool,
     truecolor: bool,
 ) {
@@ -452,71 +476,74 @@ fn push_gpu_panel(
         truecolor,
     );
 
-    let power_plain = match (gpu.power_mw, gpu.power_limit_mw) {
-        (Some(now), Some(limit)) => format!("{:.0}W / {:.0}W", now as f64 / 1000.0, limit as f64 / 1000.0),
-        (Some(now), None) => format!("{:.0}W", now as f64 / 1000.0),
-        _ => "--".to_string(),
-    };
-    let power_percent = match (gpu.power_mw, gpu.power_limit_mw) {
-        (Some(now), Some(limit)) if limit > 0 => now as f64 * 100.0 / limit as f64,
-        _ => 0.0,
-    };
-    let power_metric = metric(
-        "power",
-        &power_plain,
-        grade_rgb(power_percent, Grade::Heat),
-        color,
-        truecolor,
-    );
-    let fan_plain = gpu
-        .fan_percent
-        .map(|v| format!("{v}%"))
-        .unwrap_or_else(|| "--".into());
-    let fan_metric = metric("fan", &fan_plain, BLUE, color, truecolor);
-    let thermal_plain = format_temperature_thresholds(gpu);
-    let thermal_metric = metric(
-        "thermal",
-        &thermal_plain,
-        temperature_limit_color(gpu),
-        color,
-        truecolor,
-    );
-    push_panel_columns(frame, &[power_metric, fan_metric, thermal_metric], inner, color, truecolor);
+    if !ultra_compact {
+            let power_plain = match (gpu.power_mw, gpu.power_limit_mw) {
+                (Some(now), Some(limit)) => format!("{:.0}W / {:.0}W", now as f64 / 1000.0, limit as f64 / 1000.0),
+                (Some(now), None) => format!("{:.0}W", now as f64 / 1000.0),
+                _ => "--".to_string(),
+            };
+            let power_percent = match (gpu.power_mw, gpu.power_limit_mw) {
+                (Some(now), Some(limit)) if limit > 0 => now as f64 * 100.0 / limit as f64,
+                _ => 0.0,
+            };
+            let power_metric = metric(
+                "power",
+                &power_plain,
+                grade_rgb(power_percent, Grade::Heat),
+                color,
+                truecolor,
+            );
+            let fan_plain = gpu
+                .fan_percent
+                .map(|v| format!("{v}%"))
+                .unwrap_or_else(|| "--".into());
+            let fan_metric = metric("fan", &fan_plain, BLUE, color, truecolor);
+            let thermal_plain = format_temperature_thresholds(gpu);
+            let thermal_metric = metric(
+                "thermal",
+                &thermal_plain,
+                temperature_limit_color(gpu),
+                color,
+                truecolor,
+            );
+            push_panel_columns(frame, &[power_metric, fan_metric, thermal_metric], inner, color, truecolor);
 
-    let core_plain = gpu
-        .graphics_clock_mhz
-        .map(|v| format!("{v} MHz"))
-        .unwrap_or_else(|| "--".into());
-    let memory_clock_plain = gpu
-        .memory_clock_mhz
-        .map(|v| format!("{v} MHz"))
-        .unwrap_or_else(|| "--".into());
-    let core_metric = metric("core clock", &core_plain, TEXT, color, truecolor);
-    let memory_metric = metric("mem clock", &memory_clock_plain, TEXT, color, truecolor);
-    let limit_plain = gpu.clock_limit.as_deref().unwrap_or("--");
-    let limit_display = truncate(limit_plain, 12);
-    let limit_metric = metric(
-        "limit",
-        &limit_display,
-        clock_limit_color(limit_plain),
-        color,
-        truecolor,
-    );
-    push_panel_columns(frame, &[core_metric, memory_metric, limit_metric], inner, color, truecolor);
+            let core_plain = gpu
+                .graphics_clock_mhz
+                .map(|v| format!("{v} MHz"))
+                .unwrap_or_else(|| "--".into());
+            let memory_clock_plain = gpu
+                .memory_clock_mhz
+                .map(|v| format!("{v} MHz"))
+                .unwrap_or_else(|| "--".into());
+            let core_metric = metric("core clock", &core_plain, TEXT, color, truecolor);
+            let memory_metric = metric("mem clock", &memory_clock_plain, TEXT, color, truecolor);
+            let limit_plain = gpu.clock_limit.as_deref().unwrap_or("--");
+            let limit_display = truncate(limit_plain, 12);
+            let limit_metric = metric(
+                "limit",
+                &limit_display,
+                clock_limit_color(limit_plain),
+                color,
+                truecolor,
+            );
+            push_panel_columns(frame, &[core_metric, memory_metric, limit_metric], inner, color, truecolor);
 
-    let video_metric = video_metric(
-        gpu.encoder_util_percent,
-        gpu.decoder_util_percent,
-        color,
-        truecolor,
-    );
-    let traffic_metric = traffic_metric(
-        gpu.pcie_tx_kb_per_s,
-        gpu.pcie_rx_kb_per_s,
-        color,
-        truecolor,
-    );
-    push_panel_columns(frame, &[video_metric, traffic_metric], inner, color, truecolor);
+            let video_metric = video_metric(
+                gpu.encoder_util_percent,
+                gpu.decoder_util_percent,
+                color,
+                truecolor,
+            );
+            let traffic_metric = traffic_metric(
+                gpu.pcie_tx_kb_per_s,
+                gpu.pcie_rx_kb_per_s,
+                color,
+                truecolor,
+            );
+            push_panel_columns(frame, &[video_metric, traffic_metric], inner, color, truecolor);
+
+    }
 
     push_panel_bottom(frame, width, color, truecolor);
 }
@@ -701,6 +728,7 @@ fn push_process_panel(
     processes: &[ProcessSnapshot],
     width: usize,
     available_lines: usize,
+    ultra_compact: bool,
     color: bool,
     truecolor: bool,
 ) {
@@ -719,13 +747,15 @@ fn push_process_panel(
 
     let inner = width.saturating_sub(2);
     let columns = process_columns(inner);
-    let header = process_header(&columns, color, truecolor);
-    push_panel_line(frame, &header, inner, color, truecolor);
+    if !ultra_compact {
+        let header = process_header(&columns, color, truecolor);
+        push_panel_line(frame, &header, inner, color, truecolor);
+    }
 
-    // top + header + bottom consume 3 physical lines. Under height pressure
-    // process rows outrank the "… more" summary: with a 6-line panel we show
-    // three real processes, never two processes plus a summary.
-    let rows_available = available_lines.saturating_sub(3);
+    // Ultra-compact mode spends only top+bottom on chrome, preserving three
+    // real process rows in a five-line panel. Normal mode also shows the header.
+    let chrome_lines = if ultra_compact { 2 } else { 3 };
+    let rows_available = available_lines.saturating_sub(chrome_lines);
     let reserve_summary = processes.len() > rows_available && rows_available >= 4;
     let data_rows = if reserve_summary {
         rows_available.saturating_sub(1)
@@ -753,6 +783,7 @@ fn push_vram_holders_panel(
     snapshot: &Snapshot,
     width: usize,
     available_lines: usize,
+    ultra_compact: bool,
     color: bool,
     truecolor: bool,
 ) {
@@ -770,44 +801,52 @@ fn push_vram_holders_panel(
     push_panel_top(frame, &title_plain, &title_styled, width, color, truecolor);
 
     let inner = width.saturating_sub(2);
-    let unattributed = snapshot
-        .gpus
-        .iter()
-        .map(|gpu| gpu.memory_used.saturating_sub(gpu.memory_processes))
-        .fold(0u64, u64::saturating_add);
-    let refs = snapshot
-        .uvm_module_refcount
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "--".to_string());
-    let scan = if snapshot.uvm_scan_partial { "partial" } else { "complete" };
-    let summary_plain = format!(
-        " unattributed {}   UVM module refs {refs}   scan {scan}",
-        format_memory_pretty(unattributed)
-    );
-    let summary = if color {
-        format!(
-            " {}unattributed{RESET} {}{}{RESET}   {}UVM module refs{RESET} {}{refs}{RESET}   {}scan{RESET} {}{}{RESET}",
-            fg(MUTED, truecolor),
-            fg(AMBER, truecolor),
-            format_memory_pretty(unattributed),
-            fg(MUTED, truecolor),
-            fg(TEXT, truecolor),
-            fg(MUTED, truecolor),
-            fg(if snapshot.uvm_scan_partial { AMBER } else { ACCENT }, truecolor),
-            scan,
-        )
-    } else {
-        summary_plain.clone()
-    };
-    push_panel_line(frame, &summary, inner, color, truecolor);
-
     let columns = holder_columns(inner);
-    let header = holder_header(&columns, color, truecolor);
-    push_panel_line(frame, &header, inner, color, truecolor);
 
-    // top + summary + header + bottom consume four lines.
-    let rows_available = available_lines.saturating_sub(4);
-    let data_rows = if snapshot.vram_holders.len() > rows_available && rows_available > 0 {
+    if !ultra_compact {
+        let unattributed = snapshot
+            .gpus
+            .iter()
+            .map(|gpu| gpu.memory_used.saturating_sub(gpu.memory_processes))
+            .fold(0u64, u64::saturating_add);
+        let refs = snapshot
+            .uvm_module_refcount
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "--".to_string());
+        let scan = if snapshot.uvm_scan_partial { "partial" } else { "complete" };
+        let summary_plain = format!(
+            " unattributed {}   UVM module refs {refs}   scan {scan}",
+            format_memory_pretty(unattributed)
+        );
+        let summary = if color {
+            format!(
+                " {}unattributed{RESET} {}{}{RESET}   {}UVM module refs{RESET} {}{refs}{RESET}   {}scan{RESET} {}{}{RESET}",
+                fg(MUTED, truecolor),
+                fg(AMBER, truecolor),
+                format_memory_pretty(unattributed),
+                fg(MUTED, truecolor),
+                fg(TEXT, truecolor),
+                fg(MUTED, truecolor),
+                fg(if snapshot.uvm_scan_partial { AMBER } else { ACCENT }, truecolor),
+                scan,
+            )
+        } else {
+            summary_plain
+        };
+        push_panel_line(frame, &summary, inner, color, truecolor);
+
+        let header = holder_header(&columns, color, truecolor);
+        push_panel_line(frame, &header, inner, color, truecolor);
+    }
+
+    // In ultra-compact mode top+bottom are the only chrome, so four lines are
+    // enough for two actual holders. Normal mode keeps summary+header and needs
+    // six lines for the same two-holder guarantee. Never replace either of the
+    // two minimum holder rows with an "… more" summary.
+    let chrome_lines = if ultra_compact { 2 } else { 4 };
+    let rows_available = available_lines.saturating_sub(chrome_lines);
+    let reserve_summary = snapshot.vram_holders.len() > rows_available && rows_available >= 3;
+    let data_rows = if reserve_summary {
         rows_available.saturating_sub(1)
     } else {
         rows_available
@@ -1436,19 +1475,25 @@ mod tests {
 
 
     #[test]
-    fn height_layout_collapses_graphs_before_process_rows() {
+    fn height_layout_preserves_three_processes_and_two_holders_at_minimum() {
         assert_eq!(choose_vertical_layout(12), None);
-        let tiny = choose_vertical_layout(13).unwrap();
-        assert_eq!(tiny.graph_rows, 1);
-        assert!(!tiny.show_holders);
 
-        let compact = choose_vertical_layout(18).unwrap();
+        let minimum = choose_vertical_layout(13).unwrap();
+        assert_eq!(minimum.graph_rows, 1);
+        assert!(minimum.show_holders);
+        assert!(minimum.ultra_compact);
+        // Minimum geometry budgets exactly: GPU 4 + processes 5 + holders 4.
+        assert_eq!(4 + 5 + 4, 13);
+
+        let compact = choose_vertical_layout(19).unwrap();
         assert_eq!(compact.graph_rows, 1);
         assert!(compact.show_holders);
+        assert!(!compact.ultra_compact);
 
-        let full = choose_vertical_layout(24).unwrap();
+        let full = choose_vertical_layout(25).unwrap();
         assert_eq!(full.graph_rows, 4);
         assert!(full.show_holders);
+        assert!(!full.ultra_compact);
     }
 
     #[test]
