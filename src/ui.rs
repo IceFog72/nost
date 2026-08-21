@@ -1222,32 +1222,48 @@ fn history_graph_rows(
 fn grade_rgb(value: f64, grade: Grade) -> Rgb {
     let value = value.clamp(0.0, 100.0);
     match grade {
-        Grade::Heat => {
-            // btop-like cool -> lime -> amber -> coral progression.
-            if value <= 35.0 {
-                mix(Rgb(76, 220, 126), Rgb(177, 238, 101), value / 35.0)
-            } else if value <= 65.0 {
-                mix(Rgb(177, 238, 101), Rgb(246, 205, 92), (value - 35.0) / 30.0)
-            } else if value <= 85.0 {
-                mix(Rgb(246, 205, 92), Rgb(249, 143, 92), (value - 65.0) / 20.0)
-            } else {
-                mix(Rgb(249, 143, 92), Rgb(247, 91, 110), (value - 85.0) / 15.0)
-            }
-        }
-        Grade::Memory => {
-            // Memory starts cyan, reaches the btop-like yellow band earlier,
-            // then grades through amber into red near saturation.
-            if value <= 20.0 {
-                mix(Rgb(61, 207, 232), Rgb(68, 224, 190), value / 20.0)
-            } else if value <= 40.0 {
-                mix(Rgb(68, 224, 190), Rgb(239, 207, 92), (value - 20.0) / 20.0)
-            } else if value <= 75.0 {
-                mix(Rgb(239, 207, 92), Rgb(249, 148, 88), (value - 40.0) / 35.0)
-            } else {
-                mix(Rgb(249, 148, 88), Rgb(247, 91, 110), (value - 75.0) / 25.0)
-            }
+        Grade::Heat => gradient(
+            value,
+            &[
+                (0.0, Rgb(92, 206, 118)),
+                (18.0, Rgb(127, 214, 112)),
+                (36.0, Rgb(165, 220, 106)),
+                (54.0, Rgb(206, 214, 102)),
+                (70.0, Rgb(232, 196, 99)),
+                (84.0, Rgb(240, 167, 101)),
+                (100.0, Rgb(238, 122, 113)),
+            ],
+        ),
+        Grade::Memory => gradient(
+            value,
+            &[
+                (0.0, Rgb(82, 206, 224)),
+                (18.0, Rgb(82, 214, 204)),
+                (36.0, Rgb(104, 220, 176)),
+                (54.0, Rgb(160, 216, 130)),
+                (70.0, Rgb(214, 202, 102)),
+                (84.0, Rgb(236, 176, 97)),
+                (100.0, Rgb(239, 132, 111)),
+            ],
+        ),
+    }
+}
+
+fn gradient(value: f64, stops: &[(f64, Rgb)]) -> Rgb {
+    debug_assert!(!stops.is_empty());
+    let value = value.clamp(0.0, 100.0);
+    if value <= stops[0].0 {
+        return stops[0].1;
+    }
+    for pair in stops.windows(2) {
+        let (left_at, left_rgb) = pair[0];
+        let (right_at, right_rgb) = pair[1];
+        if value <= right_at {
+            let span = (right_at - left_at).max(f64::EPSILON);
+            return mix(left_rgb, right_rgb, (value - left_at) / span);
         }
     }
+    stops[stops.len() - 1].1
 }
 
 fn mix(left: Rgb, right: Rgb, t: f64) -> Rgb {
