@@ -1,9 +1,10 @@
 use crate::model::{GpuSnapshot, ProcessSnapshot, Snapshot, VramHolderSnapshot};
 use std::collections::{HashMap, VecDeque};
 use std::env;
-use std::ffi::{c_int, c_ulong};
+use std::ffi::{c_int, c_ulong, c_void};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, Write};
+use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 const RESET: &str = "\x1b[0m";
@@ -46,6 +47,7 @@ pub const INPUT_MODES_OFF: &str = concat!(
     "\x1b[?1015l", // urxvt mouse encoding
     "\x1b[?1016l"  // SGR pixel mouse encoding
 );
+const MOUSE_MODES_ON: &str = "\x1b[?1000h\x1b[?1006h";
 
 #[repr(C)]
 #[derive(Default)]
@@ -58,35 +60,165 @@ struct WinSize {
 
 extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
+    fn tcgetattr(fd: c_int, termios: *mut Termios) -> c_int;
+    fn tcsetattr(fd: c_int, actions: c_int, termios: *const Termios) -> c_int;
+    #[link_name = "read"]
+    fn c_read(fd: c_int, buffer: *mut c_void, count: usize) -> isize;
 }
 
+const STDIN_FILENO: c_int = 0;
 const STDOUT_FILENO: c_int = 1;
 const TIOCGWINSZ: c_ulong = 0x5413;
+const TCSANOW: c_int = 0;
+const ICANON: u32 = 0o000002;
+const ECHO: u32 = 0o000010;
+const VTIME: usize = 5;
+const VMIN: usize = 6;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Termios {
+    input_flags: u32,
+    output_flags: u32,
+    control_flags: u32,
+    local_flags: u32,
+    line_discipline: u8,
+    control_chars: [u8; 32],
+    input_speed: u32,
+    output_speed: u32,
+}
 
 pub struct TerminalGuard {
     inline: bool,
+    original_stdin: Option<Termios>,
+    input_buffer: Vec<u8>,
 }
 
 impl TerminalGuard {
-    pub fn enter(inline: bool) -> io::Result<Self> {
+    pub fn enter(inline: bool, interactive: bool) -> io::Result<Self> {
+        let original_stdin = interactive.then(enable_key_input).transpose()?.flatten();
+        let guard = Self {
+            inline,
+            original_stdin,
+            input_buffer: Vec::new(),
+        };
         let mut out = io::stdout().lock();
         if !inline {
             write!(out, "\x1b[?1049h")?;
         }
         // Disable alternate-scroll *after* entering the alternate screen.
-        // This stops wheel events being translated into ESC[A / ESC[B while
-        // nost itself remains completely non-interactive.
+        // nost reads only the documented keyboard controls.
         // Disable auto-wrap while the dashboard owns the terminal. If the
         // window becomes narrower between TIOCGWINSZ and the actual write,
         // long rows are clipped instead of wrapping into unrelated rows.
-        write!(out, "{}\x1b[?7l\x1b[?25l\x1b[2J\x1b[H", INPUT_MODES_OFF)?;
+        let mouse_modes = if guard.original_stdin.is_some() { MOUSE_MODES_ON } else { "" };
+        write!(
+            out,
+            "{}{mouse_modes}\x1b[?7l\x1b[?25l\x1b[2J\x1b[H",
+            INPUT_MODES_OFF
+        )?;
         out.flush()?;
-        Ok(Self { inline })
+        Ok(guard)
     }
+
+    pub fn read_key(&mut self, interval_ms: u64) -> io::Result<Option<u8>> {
+        if self.original_stdin.is_none() {
+            return Ok(None);
+        }
+        let mut bytes = [0u8; 64];
+        let read = unsafe { c_read(STDIN_FILENO, bytes.as_mut_ptr().cast(), bytes.len()) };
+        if read > 0 {
+            self.input_buffer.extend_from_slice(&bytes[..read as usize]);
+        } else if read < 0 {
+            let error = io::Error::last_os_error();
+            if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) {
+                return Err(error);
+            }
+        }
+        let width = terminal_size().0 as usize;
+        Ok(parse_interval_input(
+            &mut self.input_buffer,
+            interval_ms,
+            width.saturating_sub(1),
+        ))
+    }
+}
+
+fn parse_interval_input(input: &mut Vec<u8>, interval_ms: u64, width: usize) -> Option<u8> {
+    while !input.is_empty() {
+        match input[0] {
+            key @ (b'-' | b'_' | b'+' | b'=') => {
+                input.remove(0);
+                return Some(key);
+            }
+            b'\x1b' if input.len() < 3 => return None,
+            b'\x1b' if input.starts_with(b"\x1b[<") => {
+                let Some(end) = input.iter().position(|byte| matches!(byte, b'M' | b'm')) else {
+                    if input.len() > 32 {
+                        input.clear();
+                    }
+                    return None;
+                };
+                let event: Vec<u8> = input.drain(..=end).collect();
+                if event[end] != b'M' {
+                    continue;
+                }
+                let Ok(fields) = std::str::from_utf8(&event[3..end]) else {
+                    continue;
+                };
+                let mut fields = fields.split(';');
+                let (Some(button), Some(column), Some(row)) =
+                    (
+                        fields.next().and_then(|field| field.parse::<usize>().ok()),
+                        fields.next().and_then(|field| field.parse::<usize>().ok()),
+                        fields.next().and_then(|field| field.parse::<usize>().ok()),
+                    )
+                else {
+                    continue;
+                };
+                if fields.next().is_some() || button & 3 != 0 || button & 64 != 0 || row != 1 {
+                    continue;
+                }
+                let plus = width.saturating_sub(3);
+                let minus = plus.saturating_sub(interval_ms.to_string().len() + 5);
+                if column.abs_diff(plus) <= 1 {
+                    return Some(b'+');
+                }
+                if column.abs_diff(minus) <= 1 {
+                    return Some(b'-');
+                }
+            }
+            _ => {
+                input.remove(0);
+            }
+        }
+    }
+    None
+}
+
+fn enable_key_input() -> io::Result<Option<Termios>> {
+    let mut original = MaybeUninit::<Termios>::uninit();
+    if unsafe { tcgetattr(STDIN_FILENO, original.as_mut_ptr()) } != 0 {
+        return Ok(None);
+    }
+    let original = unsafe { original.assume_init() };
+    let mut interactive = original;
+    interactive.local_flags &= !(ICANON | ECHO);
+    interactive.control_chars[VMIN] = 0;
+    interactive.control_chars[VTIME] = 0;
+    if unsafe { tcsetattr(STDIN_FILENO, TCSANOW, &interactive) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(original))
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if let Some(original) = self.original_stdin {
+            unsafe {
+                let _ = tcsetattr(STDIN_FILENO, TCSANOW, &original);
+            }
+        }
         let mut out = io::stdout().lock();
         // Always leave synchronized-output mode, restore auto-wrap, and then
         // restore the cursor even if the previous frame was interrupted.
@@ -190,7 +322,7 @@ fn choose_vertical_layout(height: usize) -> Option<VerticalLayout> {
 pub fn render(
     snapshot: &Snapshot,
     history: &History,
-    _interval_ms: u64,
+    interval_ms: u64,
     _backend_label: &str,
     color: bool,
 ) -> io::Result<()> {
@@ -205,7 +337,6 @@ pub fn render(
 
     let mut frame = String::with_capacity(width.saturating_mul(height).saturating_mul(4));
     frame.push_str(SYNC_BEGIN);
-    frame.push_str(INPUT_MODES_OFF);
 
     let size_key = terminal_size_key(terminal_width as u16, terminal_height as u16);
     let previous_size = LAST_TERMINAL_SIZE.swap(size_key, Ordering::Relaxed);
@@ -261,7 +392,7 @@ pub fn render(
         .unwrap_or(0)
         .max(1);
 
-    for gpu in snapshot.gpus.iter().take(max_gpu_panels) {
+    for (position, gpu) in snapshot.gpus.iter().take(max_gpu_panels).enumerate() {
         push_gpu_panel(
             &mut frame,
             gpu,
@@ -269,6 +400,7 @@ pub fn render(
             width,
             vertical_layout.graph_rows,
             vertical_layout.ultra_compact,
+            (position == 0).then_some(interval_ms),
             color,
             truecolor,
         );
@@ -344,10 +476,17 @@ fn push_gpu_panel(
     width: usize,
     graph_rows: usize,
     ultra_compact: bool,
+    interval_ms: Option<u64>,
     color: bool,
     truecolor: bool,
 ) {
-    let title_plain = format!("GPU {}  {}", gpu.index, truncate(&gpu.name, width.saturating_sub(16)));
+    let interval_plain = interval_ms.map(|ms| format!("- {ms}ms +"));
+    let reserved = interval_plain.as_ref().map_or(0, |value| value.chars().count() + 8);
+    let title_plain = format!(
+        "GPU {}  {}",
+        gpu.index,
+        truncate(&gpu.name, width.saturating_sub(reserved + 7))
+    );
     let title_styled = if color {
         format!(
             "{BOLD}{}GPU {}{RESET}  {}{}{RESET}",
@@ -359,7 +498,22 @@ fn push_gpu_panel(
     } else {
         title_plain.clone()
     };
-    push_panel_top(frame, &title_plain, &title_styled, width, color, truecolor);
+    let interval_styled = interval_ms.map(|ms| {
+        format!(
+            "{}-{RESET} {BOLD}{ms}ms{RESET} {}+{RESET}",
+            fg(BLUE, truecolor),
+            fg(BLUE, truecolor)
+        )
+    });
+    push_panel_top(
+        frame,
+        &title_plain,
+        &title_styled,
+        interval_plain.as_deref().zip(interval_styled.as_deref()),
+        width,
+        color,
+        truecolor,
+    );
 
     let inner = width.saturating_sub(2);
 
@@ -401,7 +555,17 @@ fn push_gpu_panel(
     let mem_percent = gpu.memory_percent();
     let mem_percent_plain = format!("{:.0}%", mem_percent);
     let mem_used_plain = format_memory_pretty(gpu.memory_used);
-    let mem_total_plain = format_memory_pretty(gpu.memory_total);
+    let mem_used_compact = format_memory_compact(gpu.memory_used);
+    let mem_reserved_plain = gpu
+        .memory_reserved
+        .map(format_memory_pretty)
+        .unwrap_or_else(|| "--".to_string());
+    let mem_reserved_compact = gpu
+        .memory_reserved
+        .map(format_memory_compact)
+        .unwrap_or_else(|| "--".to_string());
+    let mem_usable_plain = format_memory_pretty(gpu.memory_usable());
+    let mem_usable_compact = format_memory_compact(gpu.memory_usable());
     let mem_percent_styled = if color {
         style(
             &mem_percent_plain,
@@ -413,16 +577,22 @@ fn push_gpu_panel(
         mem_percent_plain.clone()
     };
     let mem_used_styled = style(&mem_used_plain, CYAN, color, truecolor);
-    let mem_total_styled = style(&mem_total_plain, MUTED, color, truecolor);
+    let mem_used_compact_styled = style(&mem_used_compact, CYAN, color, truecolor);
+    let mem_reserved_styled = style(&mem_reserved_plain, AMBER, color, truecolor);
+    let mem_reserved_compact_styled = style(&mem_reserved_compact, AMBER, color, truecolor);
+    let mem_usable_styled = style(&mem_usable_plain, MUTED, color, truecolor);
+    let mem_usable_compact_styled = style(&mem_usable_compact, MUTED, color, truecolor);
 
     let (gpu_value_plain, gpu_value_styled, mem_value_plain, mem_value_styled) =
         if graph_rows <= 1 {
             (
                 vec![format!("{gpu_percent_plain}  {temp_plain}")],
                 vec![format!("{gpu_percent_styled}  {temp_styled}")],
-                vec![format!("{mem_percent_plain}  {mem_used_plain} / {mem_total_plain}")],
                 vec![format!(
-                    "{mem_percent_styled}  {mem_used_styled} / {mem_total_styled}"
+                    "{mem_percent_plain} reserved {mem_reserved_compact}/usable {mem_usable_compact}/used {mem_used_compact}"
+                )],
+                vec![format!(
+                    "{mem_percent_styled} reserved {mem_reserved_compact_styled}/usable {mem_usable_compact_styled}/used {mem_used_compact_styled}"
                 )],
             )
         } else {
@@ -431,10 +601,16 @@ fn push_gpu_panel(
                 vec![gpu_percent_styled, temp_styled],
                 vec![
                     mem_percent_plain.clone(),
-                    mem_used_plain.clone(),
-                    mem_total_plain.clone(),
+                    format!("reserved {mem_reserved_plain}"),
+                    format!("usable {mem_usable_plain}"),
+                    format!("used {mem_used_plain}"),
                 ],
-                vec![mem_percent_styled, mem_used_styled, mem_total_styled],
+                vec![
+                    mem_percent_styled,
+                    format!("reserved {mem_reserved_styled}"),
+                    format!("usable {mem_usable_styled}"),
+                    format!("used {mem_used_styled}"),
+                ],
             )
         };
 
@@ -743,7 +919,7 @@ fn push_process_panel(
     } else {
         title_plain.clone()
     };
-    push_panel_top(frame, &title_plain, &title_styled, width, color, truecolor);
+    push_panel_top(frame, &title_plain, &title_styled, None, width, color, truecolor);
 
     let inner = width.saturating_sub(2);
     let columns = process_columns(inner);
@@ -798,7 +974,7 @@ fn push_vram_holders_panel(
     } else {
         title_plain.clone()
     };
-    push_panel_top(frame, &title_plain, &title_styled, width, color, truecolor);
+    push_panel_top(frame, &title_plain, &title_styled, None, width, color, truecolor);
 
     let inner = width.saturating_sub(2);
     let columns = holder_columns(inner);
@@ -1069,20 +1245,24 @@ fn push_panel_top(
     frame: &mut String,
     title_plain: &str,
     title_styled: &str,
+    right: Option<(&str, &str)>,
     width: usize,
     color: bool,
     truecolor: bool,
 ) {
-    let fill = width.saturating_sub(title_plain.chars().count() + 5);
+    let right_len = right.map_or(0, |(plain, _)| plain.chars().count() + 3);
+    let fill = width.saturating_sub(title_plain.chars().count() + right_len + 5);
+    let right_styled = right.map_or(String::new(), |(_, styled)| format!(" {styled} {border}", border = fg(BORDER, truecolor)));
+    let right_plain = right.map_or(String::new(), |(plain, _)| format!(" {plain} ─"));
     if color {
         let border = fg(BORDER, truecolor);
         let _ = writeln!(
             frame,
-            "{border}╭─{RESET} {title_styled} {border}{}╮{RESET}",
+            "{border}╭─{RESET} {title_styled} {border}{}{right_styled}╮{RESET}",
             "─".repeat(fill)
         );
     } else {
-        let _ = writeln!(frame, "╭─ {title_plain} {}╮", "─".repeat(fill));
+        let _ = writeln!(frame, "╭─ {title_plain} {}{right_plain}╮", "─".repeat(fill));
     }
 }
 
@@ -1343,6 +1523,16 @@ fn format_memory_pretty(bytes: u64) -> String {
     }
 }
 
+fn format_memory_compact(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * MIB;
+    if bytes as f64 >= GIB {
+        format!("{:.1}G", bytes as f64 / GIB)
+    } else {
+        format!("{:.0}M", bytes as f64 / MIB)
+    }
+}
+
 fn truncate(value: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -1419,8 +1609,9 @@ pub fn should_use_color(force_no_color: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_vertical_layout, format_memory_pretty, format_pcie_rate, grade_rgb,
-        history_graph_rows, terminal_size_key, truncate, visible_len_ansi, Grade,
+        choose_vertical_layout, format_memory_compact, format_memory_pretty, format_pcie_rate, grade_rgb,
+        history_graph_rows, parse_interval_input, terminal_size_key, truncate,
+        visible_len_ansi, Grade,
     };
     use std::collections::VecDeque;
 
@@ -1430,6 +1621,18 @@ mod tests {
         let output = history_graph_rows(Some(&values), 7, 4, Grade::Heat, true, true);
         assert_eq!(output.len(), 4);
         assert!(output.iter().all(|row| visible_len_ansi(row) == 7));
+    }
+
+    #[test]
+    fn mouse_clicks_hit_interval_buttons_only() {
+        let mut plus = b"\x1b[<0;76;1M".to_vec();
+        assert_eq!(parse_interval_input(&mut plus, 500, 79), Some(b'+'));
+
+        let mut minus = b"\x1b[<0;68;1M".to_vec();
+        assert_eq!(parse_interval_input(&mut minus, 500, 79), Some(b'-'));
+
+        let mut outside = b"\x1b[<0;60;1M".to_vec();
+        assert_eq!(parse_interval_input(&mut outside, 500, 79), None);
     }
 
     #[test]
@@ -1463,6 +1666,8 @@ mod tests {
     fn memory_format_is_human_readable() {
         assert_eq!(format_memory_pretty(1024 * 1024 * 1024), "1.0 GiB");
         assert_eq!(format_memory_pretty(512 * 1024 * 1024), "512 MiB");
+        assert_eq!(format_memory_compact(1024 * 1024 * 1024), "1.0G");
+        assert_eq!(format_memory_compact(512 * 1024 * 1024), "512M");
     }
 
     #[test]

@@ -111,6 +111,8 @@ Unsupported optional metrics display as `--` instead of failing the monitor.
 
 Default refresh is 500 ms.
 
+While nost is running, press or left-click `-` or `+` to change the refresh interval by 100 ms. The current interval appears in the first GPU panel's top-right corner. The allowed range is 100 ms to 60 seconds. Hold Shift while dragging to select terminal text.
+
 ## Architecture
 
 ```text
@@ -139,4 +141,4 @@ The Rust project has **zero Cargo dependencies**. NVML is loaded with `dlopen()`
 
 ## Internal VRAM accounting
 
-nost still normalizes NVML memory-v2 accounting internally and can use DRM `fdinfo` as a cross-check, but `proc`, `reserved`, and `drm` are intentionally not rendered in the main GPU panel. Per-process VRAM stays in the process table; the third `vram holders` panel is focused specifically on finding UVM/CUDA owners that may be absent from NVML's attributable VRAM rows.
+nost normalizes NVML memory-v2 accounting internally and shows reserved, usable, and used VRAM separately. Memory percentage is used VRAM divided by usable VRAM. It can use DRM `fdinfo` as a cross-check, but `proc` and `drm` are not rendered in the main GPU panel. Per-process VRAM stays in the process table; the third `vram holders` panel is focused specifically on finding UVM/CUDA owners that may be absent from NVML's attributable VRAM rows.

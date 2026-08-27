@@ -22,7 +22,6 @@ pub struct GpuSnapshot {
     /// `used` includes `reserved`.
     pub memory_used: u64,
     /// System-reserved framebuffer memory reported by NVML memory-info v2.
-    #[allow(dead_code)]
     pub memory_reserved: Option<u64>,
     /// Sum of NVML-attributed per-process framebuffer allocations for this GPU.
     pub memory_processes: u64,
@@ -68,11 +67,17 @@ pub struct GpuSnapshot {
 }
 
 impl GpuSnapshot {
+    pub fn memory_usable(&self) -> u64 {
+        self.memory_total
+            .saturating_sub(self.memory_reserved.unwrap_or(0))
+    }
+
     pub fn memory_percent(&self) -> f64 {
-        if self.memory_total == 0 {
+        let usable = self.memory_usable();
+        if usable == 0 {
             0.0
         } else {
-            (self.memory_used as f64 * 100.0 / self.memory_total as f64).clamp(0.0, 100.0)
+            (self.memory_used as f64 * 100.0 / usable as f64).clamp(0.0, 100.0)
         }
     }
 

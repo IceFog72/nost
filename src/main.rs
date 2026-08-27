@@ -13,7 +13,6 @@ use std::env;
 use std::ffi::c_int;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
 use ui::{History, TerminalGuard};
 
@@ -23,6 +22,9 @@ static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
 const SIGWINCH: c_int = 28;
+const MIN_INTERVAL: Duration = Duration::from_millis(100);
+const MAX_INTERVAL: Duration = Duration::from_secs(60);
+const INTERVAL_STEP: Duration = Duration::from_millis(100);
 
 extern "C" {
     #[link_name = "signal"]
@@ -79,9 +81,11 @@ fn run() -> Result<(), String> {
 
     if config.demo {
         let collector = DemoCollector::new();
-        let _terminal = TerminalGuard::enter(config.inline || config.once).map_err(|e| e.to_string())?;
+        let mut terminal = TerminalGuard::enter(config.inline || config.once, !config.once)
+            .map_err(|e| e.to_string())?;
         loop_frames(
             &config,
+            &mut terminal,
             &mut history,
             || collector.collect(),
             "demo",
@@ -93,9 +97,11 @@ fn run() -> Result<(), String> {
         let mut collector = NvmlCollector::new().map_err(|error| {
             format!("{error}. Install/load the NVIDIA driver, or use ./run-demo.sh to preview the UI")
         })?;
-        let _terminal = TerminalGuard::enter(config.inline || config.once).map_err(|e| e.to_string())?;
+        let mut terminal = TerminalGuard::enter(config.inline || config.once, !config.once)
+            .map_err(|e| e.to_string())?;
         loop_frames(
             &config,
+            &mut terminal,
             &mut history,
             || collector.collect(),
             "NVML direct",
@@ -108,6 +114,7 @@ fn run() -> Result<(), String> {
 
 fn loop_frames<F>(
     config: &Config,
+    terminal: &mut TerminalGuard,
     history: &mut History,
     mut collect: F,
     backend: &str,
@@ -116,6 +123,7 @@ fn loop_frames<F>(
 where
     F: FnMut() -> model::Snapshot,
 {
+    let mut interval = config.interval;
     while RUNNING.load(Ordering::Relaxed) {
         // Consume the resize wake-up that brought us here. A new SIGWINCH that
         // arrives during collection/rendering will set the flag again and keep
@@ -127,7 +135,7 @@ where
         ui::render(
             &snapshot,
             history,
-            config.interval.as_millis().min(u64::MAX as u128) as u64,
+            interval.as_millis().min(u64::MAX as u128) as u64,
             backend,
             color,
         )
@@ -142,14 +150,18 @@ where
         // sees the still-set flag and immediately starts another frame.
 
         let elapsed = frame_started.elapsed();
-        if elapsed < config.interval {
-            sleep_interruptible(config.interval - elapsed);
+        if elapsed < interval {
+            sleep_interruptible(interval - elapsed, terminal, &mut interval)?;
         }
     }
     Ok(())
 }
 
-fn sleep_interruptible(duration: Duration) {
+fn sleep_interruptible(
+    duration: Duration,
+    terminal: &mut TerminalGuard,
+    interval: &mut Duration,
+) -> Result<(), String> {
     let deadline = Instant::now() + duration;
     while RUNNING.load(Ordering::Relaxed) {
         if RESIZE_PENDING.load(Ordering::Relaxed) {
@@ -159,9 +171,25 @@ fn sleep_interruptible(duration: Duration) {
         if now >= deadline {
             break;
         }
-        // Short slices make resize redraws responsive even if the platform's
-        // sleep implementation restarts after SIGWINCH.
-        thread::sleep((deadline - now).min(Duration::from_millis(40)));
+        if let Some(key) = terminal
+            .read_key(interval.as_millis().min(u64::MAX as u128) as u64)
+            .map_err(|error| format!("terminal input failed: {error}"))?
+        {
+            if let Some(next) = adjusted_interval(*interval, key) {
+                *interval = next;
+                break;
+            }
+        }
+        std::thread::sleep((deadline - now).min(Duration::from_millis(40)));
+    }
+    Ok(())
+}
+
+fn adjusted_interval(interval: Duration, key: u8) -> Option<Duration> {
+    match key {
+        b'-' | b'_' => Some(interval.saturating_sub(INTERVAL_STEP).max(MIN_INTERVAL)),
+        b'+' | b'=' => Some((interval + INTERVAL_STEP).min(MAX_INTERVAL)),
+        _ => None,
     }
 }
 
@@ -223,6 +251,27 @@ Options:\n  -i, --interval SECONDS  refresh interval (default: 0.5)\n\
       --no-color          disable ANSI colors\n\
   -h, --help              show this help\n\
   -V, --version           show version\n\n\
-Input:\n  nost does not read stdin, enable raw mode, or register mouse/keyboard events.\n  Ctrl-C is handled as SIGINT only."
+Input:\n  - / +                 decrease / increase refresh interval by 100 ms\n  left-click - / +      decrease / increase refresh interval by 100 ms\n  Ctrl-C                quit"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{adjusted_interval, MAX_INTERVAL, MIN_INTERVAL};
+    use std::time::Duration;
+
+    #[test]
+    fn interval_keys_adjust_and_clamp() {
+        assert_eq!(
+            adjusted_interval(Duration::from_millis(500), b'-'),
+            Some(Duration::from_millis(400))
+        );
+        assert_eq!(
+            adjusted_interval(Duration::from_millis(500), b'+'),
+            Some(Duration::from_millis(600))
+        );
+        assert_eq!(adjusted_interval(MIN_INTERVAL, b'-'), Some(MIN_INTERVAL));
+        assert_eq!(adjusted_interval(MAX_INTERVAL, b'+'), Some(MAX_INTERVAL));
+        assert_eq!(adjusted_interval(Duration::from_millis(500), b'x'), None);
+    }
 }
