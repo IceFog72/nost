@@ -5,8 +5,8 @@ Minimal btop-style NVIDIA GPU monitor written in Rust.
 This version bypasses `nvidia-smi` completely. It dynamically loads the NVIDIA
 driver's `libnvidia-ml.so.1` and queries NVML directly, so there are no subprocesses,
 CSV/XML parsing, Python, virtualenvs, or runtime package dependencies.
+<img width="1286" height="534" alt="image" src="https://github.com/user-attachments/assets/4e4634ea-22e4-44aa-91b7-c2d03d601d80" />
 
-<img width="823" height="774" alt="image" src="https://github.com/user-attachments/assets/341eb570-a13b-488d-b9cb-12b2ec8f776c" />
 
 ## Scripts
 
