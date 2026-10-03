@@ -18,7 +18,7 @@ Runtime/build scripts:
 ./run-demo.sh    # build if needed, then run the animated demo backend
 ```
 
-`build.sh` uses an existing Cargo/Rust installation when present. If Rust is missing, it bootstraps a **local** minimal stable toolchain under `.tools/` using the official rustup installer; it does not modify your shell profile. The build runs release-mode unit tests, compiles the binary, then performs a `--demo --once` smoke test.
+`build.sh` uses an existing Cargo/Rust installation when present. If Rust is missing, it bootstraps a **local** minimal stable toolchain under `.tools/` using the official rustup installer; it does not modify your shell profile. The build runs release-mode unit and CLI tests, compiles the binary, then performs a `--demo --once` smoke test.
 
 ## Install as a CLI command + desktop app
 
@@ -142,3 +142,9 @@ The Rust project has **zero Cargo dependencies**. NVML is loaded with `dlopen()`
 ## Internal VRAM accounting
 
 nost normalizes NVML memory-v2 accounting internally and shows reserved, usable, and used VRAM separately. Memory percentage is used VRAM divided by usable VRAM. It can use DRM `fdinfo` as a cross-check, but `proc` and `drm` are not rendered in the main GPU panel. Per-process VRAM stays in the process table; the third `vram holders` panel is focused specifically on finding UVM/CUDA owners that may be absent from NVML's attributable VRAM rows.
+
+GPU metrics and NVML per-process VRAM refresh every frame. The internal DRM
+cross-check is cached for up to two seconds per PID/GPU pair, and the UVM owner
+scan runs every two seconds, reducing repeated walks through `/proc`. Newly
+observed PID/GPU pairs are probed immediately. Process names and users are read
+once per PID within a frame and refreshed on the next frame.

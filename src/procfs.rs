@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+const DRM_CACHE_TTL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DrmClientMemory {
@@ -31,22 +34,37 @@ pub struct UvmProbe {
 
 pub struct Procfs {
     users: HashMap<u32, String>,
+    metadata: HashMap<u32, (String, String)>,
+    drm_cache: HashMap<(u32, String), (Instant, DrmProbe)>,
 }
 
 impl Procfs {
     pub fn new() -> Self {
         Self {
             users: load_users(),
+            metadata: HashMap::new(),
+            drm_cache: HashMap::new(),
         }
     }
 
-    pub fn metadata(&self, pid: u32) -> (String, String) {
+    /// Metadata is shared by GPU rows and UVM holders only within one collection.
+    pub fn begin_snapshot(&mut self) {
+        self.metadata.clear();
+        self.drm_cache.retain(|_, (observed, _)| observed.elapsed() < DRM_CACHE_TTL);
+    }
+
+    pub fn metadata(&mut self, pid: u32) -> (String, String) {
+        if let Some(metadata) = self.metadata.get(&pid) {
+            return metadata.clone();
+        }
         let user = self
             .uid_for_pid(pid)
             .and_then(|uid| self.users.get(&uid).cloned())
             .unwrap_or_else(|| "?".to_string());
         let name = process_name(pid).unwrap_or_else(|| "?".to_string());
-        (user, name)
+        let metadata = (user, name);
+        self.metadata.insert(pid, metadata.clone());
+        metadata
     }
 
     /// Best-effort Linux DRM fdinfo accounting for one process on one PCI GPU.
@@ -56,8 +74,23 @@ impl Procfs {
     /// deliberately ignore `system`, `memory`, `gtt`, and `stolen` regions.
     /// Multiple file descriptors can refer to the same DRM client, so results
     /// are deduplicated by `drm-client-id` and the largest observation wins.
-    pub fn drm_clients(&self, pid: u32, pci_bus_id: &str) -> DrmProbe {
-        let expected_bdf = normalize_pci_bus_id(pci_bus_id);
+    pub fn drm_clients(&mut self, pid: u32, pci_bus_id: &str) -> DrmProbe {
+        let key = (pid, normalize_pci_bus_id(pci_bus_id));
+        // DRM cross-check counters may lag live NVML allocation rows by up to
+        // two seconds, matching the independent UVM ownership scan cadence.
+        // New PID/GPU pairs are read immediately; expired entries are pruned
+        // at each snapshot so exited processes do not accumulate indefinitely.
+        if let Some((observed, probe)) = self.drm_cache.get(&key) {
+            if observed.elapsed() < DRM_CACHE_TTL {
+                return probe.clone();
+            }
+        }
+        let probe = Self::read_drm_clients(pid, &key.1);
+        self.drm_cache.insert(key, (Instant::now(), probe.clone()));
+        probe
+    }
+
+    fn read_drm_clients(pid: u32, expected_bdf: &str) -> DrmProbe {
         let entries = match fs::read_dir(format!("/proc/{pid}/fdinfo")) {
             Ok(entries) => entries,
             Err(error) => {
@@ -87,7 +120,7 @@ impl Procfs {
                 .as_deref()
                 .map(normalize_pci_bus_id)
                 .or_else(|| drm_fd_pci_bus_id(pid, &entry.file_name()));
-            if record_bdf.as_deref() != Some(expected_bdf.as_str()) {
+            if record_bdf.as_deref() != Some(expected_bdf) {
                 continue;
             }
             matched_client_ids.insert(record.client_id);
@@ -369,6 +402,68 @@ fn basename(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{basename, is_nvidia_uvm_target, normalize_pci_bus_id, parse_drm_fdinfo, parse_memory_value};
+
+    #[test]
+    fn drm_probe_cache_reuses_normalized_pair_and_expires() {
+        let mut procfs = super::Procfs::new();
+        let pid = u32::MAX; // Cannot be a Linux PID: reads deterministically return unavailable.
+        let key = (pid, "0000:01:00.0".to_string());
+        let cached = super::DrmProbe {
+            clients: vec![super::DrmClientMemory { client_id: 7, resident_device_bytes: 123 }],
+            matched_client_ids: vec![7],
+            permission_denied: false,
+        };
+        procfs.drm_cache.insert(key.clone(), (super::Instant::now(), cached.clone()));
+        procfs.begin_snapshot();
+        assert_eq!(procfs.drm_clients(pid, "00000000:01:00.0"), cached);
+        assert_eq!(procfs.drm_clients(pid, "0000:02:00.0"), super::DrmProbe::default(), "new GPU pair probes immediately");
+        assert_eq!(procfs.drm_clients(pid - 1, "0000:01:00.0"), super::DrmProbe::default(), "new PID probes immediately");
+        procfs.drm_cache.get_mut(&key).unwrap().0 = super::Instant::now() - super::DRM_CACHE_TTL;
+        assert_eq!(procfs.drm_clients(pid, "0000:01:00.0"), super::DrmProbe::default(), "expired entry re-probes");
+        for (observed, _) in procfs.drm_cache.values_mut() {
+            *observed = super::Instant::now() - super::DRM_CACHE_TTL;
+        }
+        procfs.begin_snapshot();
+        assert!(procfs.drm_cache.is_empty(), "expired inactive processes are pruned");
+    }
+
+    #[test]
+    fn metadata_is_reused_within_snapshot_and_reloaded_after_exec() {
+        use std::io::{BufRead, Write};
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ChildGuard(Command::new("/bin/sh")
+            .args(["-c", "printf 'ready\\n'; read signal; exec sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn().expect("spawn identity-changing process"));
+        let mut ready = String::new();
+        std::io::BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut ready).expect("child ready");
+        let pid = child.0.id();
+        let mut procfs = super::Procfs::new();
+        let initial = procfs.metadata(pid);
+        assert_eq!(initial.1, "sh");
+        child.0.stdin.take().unwrap().write_all(b"go\n").expect("trigger exec");
+        let started = Instant::now();
+        while super::process_name(pid).as_deref() != Some("sleep") {
+            assert!(started.elapsed() < Duration::from_secs(3), "child did not exec sleep");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(procfs.metadata(pid), initial, "same snapshot reuses metadata");
+        procfs.begin_snapshot();
+        let refreshed = procfs.metadata(pid);
+        assert_eq!(refreshed.1, "sleep", "next snapshot observes new identity");
+        assert_eq!(refreshed.0, initial.0);
+    }
 
     #[test]
     fn recognizes_only_the_nvidia_uvm_device() {

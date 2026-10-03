@@ -405,9 +405,15 @@ fn load_first_running_process_symbol(
     None
 }
 
+#[derive(Clone, Copy)]
+struct DeviceHandle {
+    index: u32,
+    handle: NvmlDevice,
+}
+
 pub struct NvmlCollector {
     api: NvmlApi,
-    devices: Vec<NvmlDevice>,
+    devices: Vec<DeviceHandle>,
     procfs: Procfs,
     process_last_seen: Vec<u64>,
     uvm_probe: UvmProbe,
@@ -416,7 +422,10 @@ pub struct NvmlCollector {
 
 impl NvmlCollector {
     pub fn new() -> Result<Self, String> {
-        let api = NvmlApi::load()?;
+        Self::from_api(NvmlApi::load()?)
+    }
+
+    fn from_api(api: NvmlApi) -> Result<Self, String> {
         let mut count = 0u32;
         let result = unsafe { (api.get_count)(&mut count) };
         if result != NVML_SUCCESS {
@@ -431,7 +440,7 @@ impl NvmlCollector {
             let mut device = ptr::null_mut();
             let result = unsafe { (api.get_handle_by_index)(index, &mut device) };
             if result == NVML_SUCCESS && !device.is_null() {
-                devices.push(device);
+                devices.push(DeviceHandle { index, handle: device });
             }
         }
 
@@ -454,19 +463,20 @@ impl NvmlCollector {
     }
 
     pub fn collect(&mut self) -> Snapshot {
+        self.procfs.begin_snapshot();
         let mut snapshot = Snapshot::default();
 
-        for index in 0..self.devices.len() {
-            let device = self.devices[index];
+        for slot in 0..self.devices.len() {
+            let DeviceHandle { index, handle: device } = self.devices[slot];
             let pci_bus_id = query_pci_bus_id(self.api.get_pci_info, device);
             let (processes, drm_resident, drm_clients, drm_status, drm_partial) =
-                self.collect_processes(index as u32, device, pci_bus_id.as_deref());
+                self.collect_processes(slot, index, device, pci_bus_id.as_deref());
             let process_memory = processes
                 .iter()
                 .filter_map(|process| process.memory_bytes)
                 .fold(0u64, u64::saturating_add);
             snapshot.gpus.push(self.collect_gpu(
-                index as u32, device, pci_bus_id, process_memory, drm_resident, drm_clients, drm_status, drm_partial,
+                index, device, pci_bus_id, process_memory, drm_resident, drm_clients, drm_status, drm_partial,
             ));
             snapshot.processes.extend(processes);
         }
@@ -619,7 +629,7 @@ impl NvmlCollector {
         }
     }
 
-    fn collect_processes(&mut self, gpu_index: u32, device: NvmlDevice, pci_bus_id: Option<&str>) -> (Vec<ProcessSnapshot>, Option<u64>, usize, DrmStatus, bool) {
+    fn collect_processes(&mut self, slot: usize, gpu_index: u32, device: NvmlDevice, pci_bus_id: Option<&str>) -> (Vec<ProcessSnapshot>, Option<u64>, usize, DrmStatus, bool) {
         let mut rows: BTreeMap<u32, ProcessGpuRow> = BTreeMap::new();
 
         if let Some(function) = self.api.get_compute_processes {
@@ -634,7 +644,6 @@ impl NvmlCollector {
         }
 
         let utilization = if let Some(function) = self.api.get_process_utilization {
-            let slot = gpu_index as usize;
             let last_seen = self.process_last_seen.get(slot).copied().unwrap_or(0);
             match query_process_utilization(function, device, last_seen) {
                 Some((values, newest_timestamp)) => {
@@ -1033,6 +1042,86 @@ fn memory_value(value: u64) -> Option<u64> {
 mod tests {
     use super::{DrmStatus, format_clock_limit, classify_drm_status, normalize_memory_v2, residual_vram, NvmlMemory, NvmlMemoryV2, NvmlPciInfo, NvmlProcessInfo, NvmlProcessUtilizationSample, NvmlUtilization, NVML_CLOCK_EVENT_REASON_GPU_IDLE, NVML_CLOCK_EVENT_REASON_HW_THERMAL, NVML_CLOCK_EVENT_REASON_SW_POWER_CAP};
     use std::mem::{align_of, size_of};
+
+    unsafe extern "C" fn fake_shutdown() -> i32 { 0 }
+    unsafe extern "C" fn fake_count(count: *mut u32) -> i32 {
+        unsafe { *count = 2; }
+        0
+    }
+    unsafe extern "C" fn fake_handle(index: u32, handle: *mut super::NvmlDevice) -> i32 {
+        if index == 0 { return 4; }
+        unsafe { *handle = std::ptr::dangling_mut::<std::ffi::c_void>(); }
+        0
+    }
+    unsafe extern "C" fn fake_name(_: super::NvmlDevice, name: *mut std::ffi::c_char, _: u32) -> i32 {
+        unsafe { *name = 0; }
+        0
+    }
+    unsafe extern "C" fn fake_utilization(_: super::NvmlDevice, value: *mut NvmlUtilization) -> i32 {
+        unsafe { *value = NvmlUtilization::default(); }
+        0
+    }
+    unsafe extern "C" fn fake_memory(_: super::NvmlDevice, value: *mut NvmlMemory) -> i32 {
+        unsafe { *value = NvmlMemory { total: 100, free: 90, used: 10 }; }
+        0
+    }
+    unsafe extern "C" fn fake_processes(_: super::NvmlDevice, count: *mut u32, infos: *mut NvmlProcessInfo) -> i32 {
+        unsafe { *count = 1; }
+        if infos.is_null() { return super::NVML_ERROR_INSUFFICIENT_SIZE; }
+        unsafe { *infos = NvmlProcessInfo { pid: std::process::id(), used_gpu_memory: 10, ..NvmlProcessInfo::default() }; }
+        0
+    }
+    unsafe extern "C" fn fake_process_utilization(_: super::NvmlDevice, samples: *mut NvmlProcessUtilizationSample, count: *mut u32, last_seen: u64) -> i32 {
+        unsafe { *count = 1; }
+        if samples.is_null() { return super::NVML_ERROR_INSUFFICIENT_SIZE; }
+        unsafe { *samples = NvmlProcessUtilizationSample { pid: std::process::id(), timestamp: last_seen + 10, sm_util: 42, ..NvmlProcessUtilizationSample::default() }; }
+        0
+    }
+
+    #[test]
+    fn skipped_device_keeps_nvml_index_and_advances_internal_timestamp_slot() {
+        let api = super::NvmlApi {
+            _library: super::DynamicLibrary { handle: std::ptr::null_mut() },
+            shutdown: fake_shutdown,
+            get_count: fake_count,
+            get_handle_by_index: fake_handle,
+            get_name: fake_name,
+            get_utilization: fake_utilization,
+            get_memory: fake_memory,
+            get_memory_v2: None,
+            get_pci_info: None,
+            get_temperature: None,
+            get_power: None,
+            get_power_limit: None,
+            get_fan: None,
+            get_clock: None,
+            get_temperature_threshold: None,
+            get_clock_event_reasons: None,
+            get_encoder_utilization: None,
+            get_decoder_utilization: None,
+            get_pcie_current_gen: None,
+            get_pcie_current_width: None,
+            get_pcie_max_gen: None,
+            get_pcie_max_width: None,
+            get_pcie_throughput: None,
+            get_compute_processes: Some(fake_processes),
+            get_graphics_processes: None,
+            get_process_utilization: Some(fake_process_utilization),
+            error_string: None,
+        };
+        let mut collector = super::NvmlCollector::from_api(api).expect("accessible GPU 1");
+        collector.uvm_probe.pids = vec![std::process::id()];
+        collector.uvm_last_scan = Some(std::time::Instant::now());
+        for timestamp in [10, 20] {
+            let snapshot = collector.collect();
+            assert_eq!(snapshot.gpus.len(), 1);
+            assert_eq!(snapshot.gpus[0].index, 1);
+            assert_eq!(snapshot.processes[0].gpu_index, 1);
+            assert_eq!(snapshot.processes[0].gpu_util, Some(42));
+            assert_eq!(snapshot.vram_holders[0].gpu_indices, vec![1]);
+            assert_eq!(collector.process_last_seen, vec![timestamp]);
+        }
+    }
 
     #[test]
     fn nvml_ffi_layout_sizes_match_linux_c_abi() {

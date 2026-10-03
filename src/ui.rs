@@ -1,4 +1,5 @@
 use crate::model::{GpuSnapshot, ProcessSnapshot, Snapshot, VramHolderSnapshot};
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::ffi::{c_int, c_ulong, c_void};
@@ -454,6 +455,11 @@ pub fn render(
         }
     }
 
+    // A line feed from the last physical row scrolls the entire dashboard.
+    // Keep the cursor after the final border so CSI J can still clear its tail.
+    if frame.ends_with('\n') {
+        frame.pop();
+    }
     frame.push_str("\x1b[J");
     frame.push_str(SYNC_END);
     flush_frame(frame)
@@ -481,19 +487,17 @@ fn push_gpu_panel(
     truecolor: bool,
 ) {
     let interval_plain = interval_ms.map(|ms| format!("- {ms}ms +"));
-    let reserved = interval_plain.as_ref().map_or(0, |value| value.chars().count() + 8);
-    let title_plain = format!(
-        "GPU {}  {}",
-        gpu.index,
-        truncate(&gpu.name, width.saturating_sub(reserved + 7))
-    );
+    let title_prefix = format!("GPU {}  ", gpu.index);
+    let right_width = interval_plain.as_ref().map_or(0, |value| value.chars().count() + 3);
+    let name = truncate(&gpu.name, width.saturating_sub(title_prefix.chars().count() + right_width + 5));
+    let title_plain = format!("{title_prefix}{name}");
     let title_styled = if color {
         format!(
             "{BOLD}{}GPU {}{RESET}  {}{}{RESET}",
             fg(ACCENT, truecolor),
             gpu.index,
             fg(TEXT, truecolor),
-            truncate(&gpu.name, width.saturating_sub(16))
+            name
         )
     } else {
         title_plain.clone()
@@ -890,8 +894,8 @@ fn push_panel_columns(
         };
         let plain_len = item.plain.chars().count();
         line.push(' ');
-        line.push_str(&item.styled);
-        let used = plain_len + 1;
+        line.push_str(clip_ansi(&item.styled, width.saturating_sub(1)).as_ref());
+        let used = plain_len.min(width.saturating_sub(1)) + 1;
         if width > used {
             line.push_str(&" ".repeat(width - used));
         }
@@ -1252,7 +1256,7 @@ fn push_panel_top(
 ) {
     let right_len = right.map_or(0, |(plain, _)| plain.chars().count() + 3);
     let fill = width.saturating_sub(title_plain.chars().count() + right_len + 5);
-    let right_styled = right.map_or(String::new(), |(_, styled)| format!(" {styled} {border}", border = fg(BORDER, truecolor)));
+    let right_styled = right.map_or(String::new(), |(_, styled)| format!(" {styled} {border}─", border = fg(BORDER, truecolor)));
     let right_plain = right.map_or(String::new(), |(plain, _)| format!(" {plain} ─"));
     if color {
         let border = fg(BORDER, truecolor);
@@ -1282,7 +1286,8 @@ fn push_panel_line(
     color: bool,
     truecolor: bool,
 ) {
-    let visible = visible_len_ansi(content);
+    let content = clip_ansi(content, inner);
+    let visible = visible_len_ansi(&content);
     let pad = inner.saturating_sub(visible);
     if color {
         let border = fg(BORDER, truecolor);
@@ -1537,16 +1542,53 @@ fn truncate(value: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
+    // These values can come from process names and other external text.
+    // Replace controls before they reach the terminal, including ESC and LF.
+    let sanitized = || value.chars().map(|ch| if ch.is_control() { '?' } else { ch });
     let count = value.chars().count();
     if count <= width {
-        return value.to_string();
+        return sanitized().collect();
     }
     if width <= 1 {
         return "…".to_string();
     }
-    let mut result: String = value.chars().take(width - 1).collect();
+    let mut result: String = sanitized().take(width - 1).collect();
     result.push('…');
     result
+}
+
+// Internal styled strings contain CSI sequences; never cut an escape in half.
+fn clip_ansi(value: &str, width: usize) -> Cow<'_, str> {
+    if visible_len_ansi(value) <= width {
+        return Cow::Borrowed(value);
+    }
+    let mut output = String::new();
+    let mut chars = value.chars().peekable();
+    let mut visible = 0usize;
+    let mut styled = false;
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            styled = true;
+            output.push(ch);
+            output.push(chars.next().expect("CSI prefix checked"));
+            for control in chars.by_ref() {
+                output.push(control);
+                if ('@'..='~').contains(&control) {
+                    break;
+                }
+            }
+        } else {
+            if visible >= width {
+                break;
+            }
+            output.push(ch);
+            visible += 1;
+        }
+    }
+    if styled {
+        output.push_str(RESET);
+    }
+    Cow::Owned(output)
 }
 
 fn visible_len_ansi(value: &str) -> usize {
@@ -1614,6 +1656,78 @@ mod tests {
         visible_len_ansi, Grade,
     };
     use std::collections::VecDeque;
+
+    #[test]
+    fn narrow_gpu_panel_keeps_metrics_and_borders_inside_width() {
+        let mut snapshot = crate::demo::DemoCollector::new().collect();
+        snapshot.gpus[0].name = "A long GPU name that exceeds the available header space".into();
+        let mut history = super::History::new(240);
+        history.update(&snapshot);
+        let mut plain_header = None;
+        for color in [false, true] {
+            let mut frame = String::new();
+            super::push_gpu_panel(&mut frame, &snapshot.gpus[0], &history, 64, 1, false, Some(60000), color, true);
+            for row in frame.lines() {
+                assert_eq!(visible_len_ansi(row), 64, "panel row exceeded its budget: {row:?}");
+                assert!(row.contains('│') || row.contains('╭') || row.contains('╰'));
+            }
+            // The header's printable characters and controls occupy the same
+            // columns whether color is enabled or disabled.
+            let header = frame.lines().next().unwrap();
+            let stripped = strip_ansi(header);
+            assert!(stripped.ends_with("- 60000ms + ─╮"));
+            if let Some(ref plain) = plain_header {
+                assert_eq!(&stripped, plain);
+            } else {
+                plain_header = Some(stripped);
+            }
+        }
+    }
+
+    fn strip_ansi(value: &str) -> String {
+        let mut output = String::new();
+        let mut chars = value.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' && chars.peek() == Some(&'[') {
+                chars.next();
+                for control in chars.by_ref() {
+                    if ('@'..='~').contains(&control) { break; }
+                }
+            } else {
+                output.push(ch);
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn panel_boundary_clips_styled_content_without_broken_escapes() {
+        let mut frame = String::new();
+        super::push_panel_line(&mut frame, "\x1b[38;2;1;2;3mabcdefgh\x1b[0m", 4, true, true);
+        assert_eq!(visible_len_ansi(frame.trim_end()), 6);
+        assert_eq!(strip_ansi(frame.trim_end()), "│abcd│");
+        assert!(frame.contains("abcd\x1b[0m"));
+        assert_eq!(super::clip_ansi("abcdef", 0), "");
+    }
+
+    #[test]
+    fn external_text_cannot_emit_terminal_controls() {
+        assert_eq!(truncate("a\x1b[2J\nb\rc\td", 50), "a?[2J?b?c?d");
+        let mut snapshot = crate::demo::DemoCollector::new().collect();
+        snapshot.processes[0].name = "process\x1b[2J\nnext".into();
+        snapshot.processes[0].user = "user\rname".into();
+        snapshot.vram_holders[0].name = snapshot.processes[0].name.clone();
+        snapshot.vram_holders[0].user = snapshot.processes[0].user.clone();
+        for color in [false, true] {
+            let process = super::process_line(&snapshot.processes[0], &super::process_columns(100), color, true);
+            let holder = super::holder_line(&snapshot.vram_holders[0], &super::holder_columns(100), color, true);
+            for line in [process, holder] {
+                assert!(!line.contains("\x1b[2J"));
+                assert!(!line.contains('\n'));
+                assert!(!line.contains('\r'));
+            }
+        }
+    }
 
     #[test]
     fn history_graph_has_requested_rows_and_width() {
