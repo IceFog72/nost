@@ -64,7 +64,7 @@ fn sigtstp_restores_terminal_then_reenters_on_continue() {
     use std::thread::sleep;
     use std::time::Duration;
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_nost"))
+    let child = Command::new(env!("CARGO_BIN_EXE_nost"))
         .args(["--demo", "--no-color", "--interval", "0.1"])
         .env("COLUMNS", "80")
         .env("LINES", "25")
