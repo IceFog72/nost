@@ -15,7 +15,7 @@ pub enum DrmStatus {
 pub struct GpuSnapshot {
     pub index: u32,
     pub name: String,
-    pub gpu_util: u32,
+    pub gpu_util: Option<u32>,
     pub memory_total: u64,
     /// Non-reserved framebuffer allocations. NVML v2 is normalized so this
     /// value has the same meaning even on drivers that disagree about whether

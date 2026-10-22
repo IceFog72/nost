@@ -653,9 +653,9 @@ impl NvmlCollector {
 
         let mut utilization = NvmlUtilization::default();
         let gpu_util = if unsafe { (self.api.get_utilization)(device, &mut utilization) } == NVML_SUCCESS {
-            utilization.gpu.min(100)
+            Some(utilization.gpu.min(100))
         } else {
-            0
+            None
         };
 
         let (memory_total, memory_used, memory_reserved) = query_memory(

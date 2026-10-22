@@ -27,7 +27,7 @@ impl DemoCollector {
         let gpus = vec![GpuSnapshot {
             index: 0,
             name: "NVIDIA GeForce RTX 3060 Laptop GPU".to_string(),
-            gpu_util,
+            gpu_util: Some(gpu_util),
             memory_total: total,
             memory_used,
             memory_reserved: Some(64 * 1024 * 1024),

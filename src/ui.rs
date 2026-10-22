@@ -281,7 +281,7 @@ impl History {
         for gpu in &snapshot.gpus {
             push_bounded(
                 self.gpu.entry(gpu.index).or_default(),
-                gpu.gpu_util as f64,
+                gpu.gpu_util.unwrap_or(0) as f64,
                 self.max_len,
             );
             push_bounded(
@@ -554,18 +554,19 @@ fn push_gpu_panel(
     // meter rows. Full-height mode stacks values vertically at the right edge.
     // When height pressure collapses each graph to one terminal row, combine
     // the readings on that single row so no important live value disappears.
-    let gpu_percent_plain = format!("{}%", gpu.gpu_util);
+    let gpu_percent_plain = gpu
+        .gpu_util
+        .map(|v| format!("{v}%"))
+        .unwrap_or_else(|| "--".into());
     let temp_plain = gpu
         .temperature_c
         .map(|v| format!("{v}°C"))
         .unwrap_or_else(|| "--".into());
     let gpu_percent_styled = if color {
-        style(
-            &gpu_percent_plain,
-            grade_rgb(gpu.gpu_util as f64, Grade::Heat),
-            color,
-            truecolor,
-        )
+        let rgb = gpu
+            .gpu_util
+            .map_or(MUTED, |v| grade_rgb(v as f64, Grade::Heat));
+        style(&gpu_percent_plain, rgb, color, truecolor)
     } else {
         gpu_percent_plain.clone()
     };
@@ -1685,6 +1686,19 @@ mod tests {
         visible_len_ansi, Grade,
     };
     use std::collections::VecDeque;
+
+    #[test]
+    fn missing_gpu_utilization_renders_dashes() {
+        let mut snapshot = crate::demo::DemoCollector::new().collect();
+        snapshot.gpus[0].gpu_util = None;
+        let mut history = super::History::new(240);
+        history.update(&snapshot);
+        let mut frame = String::new();
+        super::push_gpu_panel(&mut frame, &snapshot.gpus[0], &history, 100, 1, false, None, false, true);
+        let gpu_row = frame.lines().find(|row| row.contains(" gpu ")).expect("gpu graph row");
+        assert!(gpu_row.contains("--  "), "{gpu_row:?}");
+        assert!(!gpu_row.contains("0%  "), "{gpu_row:?}");
+    }
 
     #[test]
     fn narrow_gpu_panel_keeps_metrics_and_borders_inside_width() {
