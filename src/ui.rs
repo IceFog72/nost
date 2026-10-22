@@ -155,7 +155,7 @@ impl TerminalGuard {
 fn parse_interval_input(input: &mut Vec<u8>, interval_ms: u64, width: usize) -> Option<u8> {
     while !input.is_empty() {
         match input[0] {
-            key @ (b'-' | b'_' | b'+' | b'=') => {
+            key @ (b'-' | b'_' | b'+' | b'=' | b'q' | b'Q') => {
                 input.remove(0);
                 return Some(key);
             }
@@ -1778,6 +1778,13 @@ mod tests {
         let output = history_graph_rows(Some(&values), 7, 4, Grade::Heat, true, true);
         assert_eq!(output.len(), 4);
         assert!(output.iter().all(|row| visible_len_ansi(row) == 7));
+    }
+
+    #[test]
+    fn quit_key_is_reported() {
+        let mut input = b"xq".to_vec();
+        assert_eq!(parse_interval_input(&mut input, 500, 79), Some(b'q'));
+        assert!(input.is_empty());
     }
 
     #[test]

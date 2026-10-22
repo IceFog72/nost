@@ -205,6 +205,10 @@ fn sleep_interruptible(
             .read_key(interval.as_millis().min(u64::MAX as u128) as u64)
             .map_err(|error| format!("terminal input failed: {error}"))?
         {
+            if is_quit_key(key) {
+                RUNNING.store(false, Ordering::Relaxed);
+                break;
+            }
             if let Some(next) = adjusted_interval(*interval, key) {
                 *interval = next;
                 break;
@@ -213,6 +217,10 @@ fn sleep_interruptible(
         std::thread::sleep((deadline - now).min(Duration::from_millis(40)));
     }
     Ok(())
+}
+
+fn is_quit_key(key: u8) -> bool {
+    matches!(key, b'q' | b'Q')
 }
 
 fn adjusted_interval(interval: Duration, key: u8) -> Option<Duration> {
@@ -282,14 +290,22 @@ Options:\n  -i, --interval SECONDS  refresh interval (default: 0.5)\n\
       --no-color          disable ANSI colors\n\
   -h, --help              show this help\n\
   -V, --version           show version\n\n\
-Input:\n  - / +                 decrease / increase refresh interval by 100 ms\n  left-click - / +      decrease / increase refresh interval by 100 ms\n  Ctrl-Z                suspend (resume with fg)\n  Ctrl-C                quit"
+Input:\n  - / +                 decrease / increase refresh interval by 100 ms\n  left-click - / +      decrease / increase refresh interval by 100 ms\n  Ctrl-Z                suspend (resume with fg)\n  q                     quit\n  Ctrl-C                quit"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{adjusted_interval, MAX_INTERVAL, MIN_INTERVAL};
+    use super::{adjusted_interval, is_quit_key, MAX_INTERVAL, MIN_INTERVAL};
     use std::time::Duration;
+
+    #[test]
+    fn quit_keys_are_recognized() {
+        assert!(is_quit_key(b'q'));
+        assert!(is_quit_key(b'Q'));
+        assert!(!is_quit_key(b'+'));
+        assert_eq!(adjusted_interval(Duration::from_millis(500), b'q'), None);
+    }
 
     #[test]
     fn interval_keys_adjust_and_clamp() {
