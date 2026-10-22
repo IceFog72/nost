@@ -94,3 +94,16 @@ fn sigtstp_restores_terminal_then_reenters_on_continue() {
     assert!(suspend_at < resume_at);
     assert!(stdout[..resume_at].contains("\x1b[?25h"), "cursor shown while suspended");
 }
+
+#[test]
+fn demo_json_is_one_escape_free_line() {
+    let output = Command::new(env!("CARGO_BIN_EXE_nost"))
+        .args(["--demo", "--json"])
+        .output()
+        .expect("run demo json");
+    assert!(output.status.success(), "{:?}", output.stderr);
+    let text = String::from_utf8(output.stdout).expect("UTF-8");
+    assert_eq!(text.lines().count(), 1);
+    assert!(!text.contains('\x1b'));
+    assert!(text.starts_with("{\"schema\":1,"));
+}

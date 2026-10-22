@@ -2,6 +2,7 @@
 compile_error!("nost currently supports Linux only");
 
 mod demo;
+mod json;
 mod model;
 mod nvml;
 mod procfs;
@@ -71,6 +72,7 @@ struct Config {
     inline: bool,
     demo: bool,
     no_color: bool,
+    json: bool,
 }
 
 impl Default for Config {
@@ -81,6 +83,7 @@ impl Default for Config {
             inline: false,
             demo: false,
             no_color: false,
+            json: false,
         }
     }
 }
@@ -97,6 +100,17 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let config = parse_args()?;
+    if config.json {
+        let snapshot = if config.demo {
+            DemoCollector::new().collect()
+        } else {
+            NvmlCollector::new()
+                .map_err(|error| format!("{error}. Install/load the NVIDIA driver, or use --demo"))?
+                .collect()
+        };
+        println!("{}", json::snapshot_to_json(&snapshot));
+        return Ok(());
+    }
     install_signal_handlers();
 
     let color = ui::should_use_color(config.no_color);
@@ -264,6 +278,7 @@ fn parse_args() -> Result<Config, String> {
             "--inline" => config.inline = true,
             "--demo" => config.demo = true,
             "--no-color" => config.no_color = true,
+            "--json" => config.json = true,
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -288,6 +303,7 @@ Options:\n  -i, --interval SECONDS  refresh interval (default: 0.5)\n\
       --inline            use the normal terminal screen\n\
       --demo              animated UI without NVIDIA hardware\n\
       --no-color          disable ANSI colors\n\
+      --json              print one snapshot as JSON and exit\n\
   -h, --help              show this help\n\
   -V, --version           show version\n\n\
 Input:\n  - / +                 decrease / increase refresh interval by 100 ms\n  left-click - / +      decrease / increase refresh interval by 100 ms\n  Ctrl-Z                suspend (resume with fg)\n  q                     quit\n  Ctrl-C                quit"
