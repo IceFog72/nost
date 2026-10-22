@@ -57,3 +57,40 @@ fn demo_frames_fit_terminal_and_do_not_scroll_the_last_row() {
         }
     }
 }
+
+#[test]
+fn sigtstp_restores_terminal_then_reenters_on_continue() {
+    use std::process::Stdio;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nost"))
+        .args(["--demo", "--no-color", "--interval", "0.1"])
+        .env("COLUMNS", "80")
+        .env("LINES", "25")
+        .stdout(Stdio::piped())
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn demo");
+    let pid = child.id().to_string();
+    let signal = |name: &str| {
+        let status = Command::new("kill").args([&format!("-{name}"), &pid]).status().expect("kill");
+        assert!(status.success());
+    };
+    sleep(Duration::from_millis(300));
+    signal("TSTP");
+    sleep(Duration::from_millis(300));
+    signal("CONT");
+    sleep(Duration::from_millis(300));
+    signal("TERM");
+    let output = child.wait_with_output().expect("wait");
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // enter, leave (suspend), enter (resume), leave (exit)
+    assert_eq!(stdout.matches("\x1b[?1049h").count(), 2, "alt screen entered on start and resume");
+    assert_eq!(stdout.matches("\x1b[?1049l").count(), 2, "alt screen left on suspend and exit");
+    let suspend_at = stdout.find("\x1b[?1049l").unwrap();
+    let resume_at = stdout.rfind("\x1b[?1049h").unwrap();
+    assert!(suspend_at < resume_at);
+    assert!(stdout[..resume_at].contains("\x1b[?25h"), "cursor shown while suspended");
+}

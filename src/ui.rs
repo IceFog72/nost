@@ -91,6 +91,7 @@ struct Termios {
 
 pub struct TerminalGuard {
     inline: bool,
+    interactive: bool,
     original_stdin: Option<Termios>,
     input_buffer: Vec<u8>,
 }
@@ -100,11 +101,17 @@ impl TerminalGuard {
         let original_stdin = interactive.then(enable_key_input).transpose()?.flatten();
         let guard = Self {
             inline,
+            interactive,
             original_stdin,
             input_buffer: Vec::new(),
         };
+        guard.write_enter_sequence()?;
+        Ok(guard)
+    }
+
+    fn write_enter_sequence(&self) -> io::Result<()> {
         let mut out = io::stdout().lock();
-        if !inline {
+        if !self.inline {
             write!(out, "\x1b[?1049h")?;
         }
         // Disable alternate-scroll *after* entering the alternate screen.
@@ -112,14 +119,14 @@ impl TerminalGuard {
         // Disable auto-wrap while the dashboard owns the terminal. If the
         // window becomes narrower between TIOCGWINSZ and the actual write,
         // long rows are clipped instead of wrapping into unrelated rows.
-        let mouse_modes = if guard.original_stdin.is_some() { MOUSE_MODES_ON } else { "" };
+        let mouse_modes = if self.original_stdin.is_some() { MOUSE_MODES_ON } else { "" };
         write!(
             out,
             "{}{mouse_modes}\x1b[?7l\x1b[?25l\x1b[2J\x1b[H",
             INPUT_MODES_OFF
         )?;
         out.flush()?;
-        Ok(guard)
+        Ok(())
     }
 
     pub fn read_key(&mut self, interval_ms: u64) -> io::Result<Option<u8>> {
@@ -213,8 +220,8 @@ fn enable_key_input() -> io::Result<Option<Termios>> {
     Ok(Some(original))
 }
 
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
+impl TerminalGuard {
+    fn leave(&mut self) {
         if let Some(original) = self.original_stdin {
             unsafe {
                 let _ = tcsetattr(STDIN_FILENO, TCSANOW, &original);
@@ -230,6 +237,28 @@ impl Drop for TerminalGuard {
             let _ = writeln!(out);
         }
         let _ = out.flush();
+    }
+
+    /// Hand the terminal back to the shell before the process stops (Ctrl-Z).
+    pub fn suspend(&mut self) {
+        self.leave();
+    }
+
+    /// Re-enter dashboard modes after SIGCONT. The shell may have changed the
+    /// tty settings while we were stopped, so capture them again as the state
+    /// to restore on the next leave.
+    pub fn resume(&mut self) -> io::Result<()> {
+        if self.interactive {
+            self.original_stdin = enable_key_input()?;
+        }
+        self.input_buffer.clear();
+        self.write_enter_sequence()
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.leave();
     }
 }
 

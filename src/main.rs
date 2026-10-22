@@ -18,10 +18,13 @@ use ui::{History, TerminalGuard};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 static RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
+static SUSPEND_PENDING: AtomicBool = AtomicBool::new(false);
 
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
 const SIGWINCH: c_int = 28;
+const SIGTSTP: c_int = 20;
+const SIG_DFL: usize = 0;
 const MIN_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_INTERVAL: Duration = Duration::from_secs(60);
 const INTERVAL_STEP: Duration = Duration::from_millis(100);
@@ -29,6 +32,7 @@ const INTERVAL_STEP: Duration = Duration::from_millis(100);
 extern "C" {
     #[link_name = "signal"]
     fn c_signal(signal: c_int, handler: usize) -> usize;
+    fn raise(signal: c_int) -> c_int;
 }
 
 extern "C" fn stop_signal(_signal: c_int) {
@@ -39,6 +43,25 @@ extern "C" fn resize_signal(_signal: c_int) {
     // Do not perform terminal I/O from a signal handler. The render loop polls
     // this flag and redraws within at most one short sleep slice.
     RESIZE_PENDING.store(true, Ordering::Relaxed);
+}
+
+extern "C" fn suspend_signal(_signal: c_int) {
+    // Terminal I/O is not async-signal-safe; the loop performs the suspend.
+    SUSPEND_PENDING.store(true, Ordering::Relaxed);
+}
+
+fn suspend_process(terminal: &mut TerminalGuard) -> Result<(), String> {
+    terminal.suspend();
+    unsafe {
+        // Stop with the default action so the shell sees a normal job stop,
+        // then reinstall our handler once SIGCONT resumes us here.
+        let _ = c_signal(SIGTSTP, SIG_DFL);
+        let _ = raise(SIGTSTP);
+        let _ = c_signal(SIGTSTP, suspend_signal as *const () as usize);
+    }
+    terminal
+        .resume()
+        .map_err(|error| format!("terminal resume failed: {error}"))
 }
 
 #[derive(Debug)]
@@ -129,6 +152,9 @@ where
         // arrives during collection/rendering will set the flag again and keep
         // us from sleeping after this frame.
         RESIZE_PENDING.store(false, Ordering::Relaxed);
+        if SUSPEND_PENDING.swap(false, Ordering::Relaxed) {
+            suspend_process(terminal)?;
+        }
         let frame_started = Instant::now();
         let snapshot = collect();
         history.update(&snapshot);
@@ -164,6 +190,10 @@ fn sleep_interruptible(
 ) -> Result<(), String> {
     let deadline = Instant::now() + duration;
     while RUNNING.load(Ordering::Relaxed) {
+        if SUSPEND_PENDING.swap(false, Ordering::Relaxed) {
+            suspend_process(terminal)?;
+            break; // redraw immediately after resume
+        }
         if RESIZE_PENDING.load(Ordering::Relaxed) {
             break;
         }
@@ -200,6 +230,7 @@ fn install_signal_handlers() {
         let _ = c_signal(SIGINT, handler);
         let _ = c_signal(SIGTERM, handler);
         let _ = c_signal(SIGWINCH, resize_handler);
+        let _ = c_signal(SIGTSTP, suspend_signal as *const () as usize);
     }
 }
 
@@ -251,7 +282,7 @@ Options:\n  -i, --interval SECONDS  refresh interval (default: 0.5)\n\
       --no-color          disable ANSI colors\n\
   -h, --help              show this help\n\
   -V, --version           show version\n\n\
-Input:\n  - / +                 decrease / increase refresh interval by 100 ms\n  left-click - / +      decrease / increase refresh interval by 100 ms\n  Ctrl-C                quit"
+Input:\n  - / +                 decrease / increase refresh interval by 100 ms\n  left-click - / +      decrease / increase refresh interval by 100 ms\n  Ctrl-Z                suspend (resume with fg)\n  Ctrl-C                quit"
     );
 }
 
