@@ -105,6 +105,16 @@ impl Procfs {
         let mut clients: BTreeMap<u64, u64> = BTreeMap::new();
         let mut permission_denied = false;
         for entry in entries.flatten() {
+            let fd_target = match fs::read_link(Path::new(&format!("/proc/{pid}/fd")).join(entry.file_name())) {
+                Ok(target) => target,
+                Err(error) => {
+                    permission_denied |= error.kind() == std::io::ErrorKind::PermissionDenied;
+                    continue;
+                }
+            };
+            if !is_drm_device_target(&fd_target) {
+                continue;
+            }
             let text = match fs::read_to_string(entry.path()) {
                 Ok(text) => text,
                 Err(error) => {
@@ -119,7 +129,7 @@ impl Procfs {
                 .pci_bus_id
                 .as_deref()
                 .map(normalize_pci_bus_id)
-                .or_else(|| drm_fd_pci_bus_id(pid, &entry.file_name()));
+                .or_else(|| drm_fd_pci_bus_id(&fd_target));
             if record_bdf.as_deref() != Some(expected_bdf) {
                 continue;
             }
@@ -279,8 +289,7 @@ fn parse_drm_fdinfo(text: &str) -> Option<DrmFdinfoRecord> {
     })
 }
 
-fn drm_fd_pci_bus_id(pid: u32, fd_name: &std::ffi::OsStr) -> Option<String> {
-    let fd_target = fs::read_link(Path::new(&format!("/proc/{pid}/fd")).join(fd_name)).ok()?;
+fn drm_fd_pci_bus_id(fd_target: &Path) -> Option<String> {
     let node = fd_target.file_name()?.to_str()?;
     if !(node.starts_with("card") || node.starts_with("renderD")) {
         return None;
@@ -339,6 +348,14 @@ pub fn normalize_pci_bus_id(value: &str) -> String {
 
 fn is_nvidia_uvm_target(target: &Path) -> bool {
     target == Path::new("/dev/nvidia-uvm")
+}
+
+fn is_drm_device_target(target: &Path) -> bool {
+    target.parent() == Some(Path::new("/dev/dri"))
+        && target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("card") || name.starts_with("renderD"))
 }
 
 fn load_users() -> HashMap<u32, String> {
@@ -401,7 +418,7 @@ fn basename(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{basename, is_nvidia_uvm_target, normalize_pci_bus_id, parse_drm_fdinfo, parse_memory_value};
+    use super::{basename, is_drm_device_target, is_nvidia_uvm_target, normalize_pci_bus_id, parse_drm_fdinfo, parse_memory_value};
 
     #[test]
     fn drm_probe_cache_reuses_normalized_pair_and_expires() {
@@ -463,6 +480,17 @@ mod tests {
         let refreshed = procfs.metadata(pid);
         assert_eq!(refreshed.1, "sleep", "next snapshot observes new identity");
         assert_eq!(refreshed.0, initial.0);
+    }
+
+    #[test]
+    fn recognizes_only_drm_device_nodes() {
+        use std::path::Path;
+        assert!(is_drm_device_target(Path::new("/dev/dri/card0")));
+        assert!(is_drm_device_target(Path::new("/dev/dri/renderD128")));
+        assert!(!is_drm_device_target(Path::new("/dev/dri/by-path")));
+        assert!(!is_drm_device_target(Path::new("/dev/nvidia0")));
+        assert!(!is_drm_device_target(Path::new("anon_inode:inotify")));
+        assert!(!is_drm_device_target(Path::new("/tmp/dri/card0")));
     }
 
     #[test]
