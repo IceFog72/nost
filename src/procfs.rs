@@ -57,10 +57,11 @@ impl Procfs {
         if let Some(metadata) = self.metadata.get(&pid) {
             return metadata.clone();
         }
-        let user = self
-            .uid_for_pid(pid)
-            .and_then(|uid| self.users.get(&uid).cloned())
-            .unwrap_or_else(|| "?".to_string());
+        // Users from LDAP/SSSD/homed are not in /etc/passwd; show the UID like ps does.
+        let user = match self.uid_for_pid(pid) {
+            Some(uid) => self.users.get(&uid).cloned().unwrap_or_else(|| uid.to_string()),
+            None => "?".to_string(),
+        };
         let name = process_name(pid).unwrap_or_else(|| "?".to_string());
         let metadata = (user, name);
         self.metadata.insert(pid, metadata.clone());
@@ -559,4 +560,14 @@ mod tests {
         assert_eq!(record.resident_device_bytes, Some(12 * 1024 * 1024));
     }
 
+    #[test]
+    fn unknown_uid_is_shown_numerically() {
+        let mut procfs = super::Procfs::new();
+        let pid = std::process::id();
+        let uid = procfs.uid_for_pid(pid).expect("own uid readable");
+        procfs.users.clear();
+        assert_eq!(procfs.metadata(pid).0, uid.to_string());
+        procfs.begin_snapshot();
+        assert_eq!(procfs.metadata(u32::MAX).0, "?", "unreadable process stays unknown");
+    }
 }
