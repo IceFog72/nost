@@ -4,6 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::mem;
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const NVML_SUCCESS: i32 = 0;
@@ -411,6 +414,84 @@ struct DeviceHandle {
     handle: NvmlDevice,
 }
 
+/// Latest PCIe TX/RX readings per device slot.
+type PcieReadings = Vec<(Option<u32>, Option<u32>)>;
+
+/// nvmlDeviceGetPcieThroughput blocks ~20 ms per counter while it samples.
+/// Run it off the render loop and publish the newest values instead.
+struct PcieSampler {
+    stop: Arc<AtomicBool>,
+    readings: Arc<Mutex<PcieReadings>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// NVML handles are process-wide and NVML is thread-safe; the handles stay
+/// valid until nvmlShutdown, which NvmlCollector::drop calls only after the
+/// sampler thread has been joined.
+#[derive(Clone, Copy)]
+struct SendDevice(NvmlDevice);
+unsafe impl Send for SendDevice {}
+
+const PCIE_SAMPLE_PAUSE: Duration = Duration::from_millis(400);
+
+fn sample_pcie(function: GetPcieThroughputFn, devices: &[SendDevice]) -> PcieReadings {
+    devices
+        .iter()
+        .map(|device| {
+            (
+                query_pcie_throughput(Some(function), device.0, NVML_PCIE_UTIL_TX_BYTES),
+                query_pcie_throughput(Some(function), device.0, NVML_PCIE_UTIL_RX_BYTES),
+            )
+        })
+        .collect()
+}
+
+impl PcieSampler {
+    fn start(function: GetPcieThroughputFn, devices: Vec<SendDevice>) -> Self {
+        // Take the first sample synchronously so `--once` and the first
+        // frame still show real numbers.
+        let readings = Arc::new(Mutex::new(sample_pcie(function, &devices)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let readings = Arc::clone(&readings);
+            let stop = Arc::clone(&stop);
+            std::thread::Builder::new()
+                .name("nost-pcie".into())
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let started = Instant::now();
+                        while started.elapsed() < PCIE_SAMPLE_PAUSE && !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(25));
+                        }
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let fresh = sample_pcie(function, &devices);
+                        *readings.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = fresh;
+                    }
+                })
+                .ok()
+        };
+        Self { stop, readings, thread }
+    }
+
+    fn get(&self, slot: usize) -> (Option<u32>, Option<u32>) {
+        self.readings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(slot)
+            .copied()
+            .unwrap_or((None, None))
+    }
+
+    fn stop_and_join(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 pub struct NvmlCollector {
     api: NvmlApi,
     devices: Vec<DeviceHandle>,
@@ -418,6 +499,7 @@ pub struct NvmlCollector {
     process_last_seen: Vec<u64>,
     uvm_probe: UvmProbe,
     uvm_last_scan: Option<Instant>,
+    pcie: Option<PcieSampler>,
 }
 
 impl NvmlCollector {
@@ -451,6 +533,10 @@ impl NvmlCollector {
             return Err("NVML initialized but no accessible NVIDIA GPUs were found".to_string());
         }
 
+        let pcie = api.get_pcie_throughput.map(|function| {
+            PcieSampler::start(function, devices.iter().map(|device| SendDevice(device.handle)).collect())
+        });
+
         let process_last_seen = vec![0; devices.len()];
         Ok(Self {
             api,
@@ -459,6 +545,7 @@ impl NvmlCollector {
             process_last_seen,
             uvm_probe: UvmProbe::default(),
             uvm_last_scan: None,
+            pcie,
         })
     }
 
@@ -475,9 +562,13 @@ impl NvmlCollector {
                 .iter()
                 .filter_map(|process| process.memory_bytes)
                 .fold(0u64, u64::saturating_add);
-            snapshot.gpus.push(self.collect_gpu(
+            let mut gpu = self.collect_gpu(
                 index, device, pci_bus_id, process_memory, drm_resident, drm_clients, drm_status, drm_partial,
-            ));
+            );
+            if let Some(sampler) = &self.pcie {
+                (gpu.pcie_tx_kb_per_s, gpu.pcie_rx_kb_per_s) = sampler.get(slot);
+            }
+            snapshot.gpus.push(gpu);
             snapshot.processes.extend(processes);
         }
 
@@ -616,16 +707,8 @@ impl NvmlCollector {
             pcie_current_width: query_u32(self.api.get_pcie_current_width, device),
             pcie_max_gen: query_u32(self.api.get_pcie_max_gen, device),
             pcie_max_width: query_u32(self.api.get_pcie_max_width, device),
-            pcie_tx_kb_per_s: query_pcie_throughput(
-                self.api.get_pcie_throughput,
-                device,
-                NVML_PCIE_UTIL_TX_BYTES,
-            ),
-            pcie_rx_kb_per_s: query_pcie_throughput(
-                self.api.get_pcie_throughput,
-                device,
-                NVML_PCIE_UTIL_RX_BYTES,
-            ),
+            pcie_tx_kb_per_s: None,
+            pcie_rx_kb_per_s: None,
         }
     }
 
@@ -702,6 +785,10 @@ impl NvmlCollector {
 
 impl Drop for NvmlCollector {
     fn drop(&mut self) {
+        // The sampler thread must stop calling NVML before shutdown.
+        if let Some(mut sampler) = self.pcie.take() {
+            sampler.stop_and_join();
+        }
         unsafe {
             let _ = (self.api.shutdown)();
         }
@@ -1078,9 +1165,13 @@ mod tests {
         0
     }
 
-    #[test]
-    fn skipped_device_keeps_nvml_index_and_advances_internal_timestamp_slot() {
-        let api = super::NvmlApi {
+    unsafe extern "C" fn fake_pcie(_: super::NvmlDevice, counter: u32, value: *mut u32) -> i32 {
+        unsafe { *value = if counter == super::NVML_PCIE_UTIL_TX_BYTES { 111 } else { 222 }; }
+        0
+    }
+
+    fn fake_api(pcie: Option<super::GetPcieThroughputFn>) -> super::NvmlApi {
+        super::NvmlApi {
             _library: super::DynamicLibrary { handle: std::ptr::null_mut() },
             shutdown: fake_shutdown,
             get_count: fake_count,
@@ -1103,12 +1194,30 @@ mod tests {
             get_pcie_current_width: None,
             get_pcie_max_gen: None,
             get_pcie_max_width: None,
-            get_pcie_throughput: None,
+            get_pcie_throughput: pcie,
             get_compute_processes: Some(fake_processes),
             get_graphics_processes: None,
             get_process_utilization: Some(fake_process_utilization),
             error_string: None,
-        };
+        }
+    }
+
+    #[test]
+    fn pcie_readings_come_from_sampler_and_drop_joins_thread() {
+        let api = fake_api(Some(fake_pcie));
+        let mut collector = super::NvmlCollector::from_api(api).expect("accessible GPU 1");
+        collector.uvm_last_scan = Some(std::time::Instant::now());
+        let snapshot = collector.collect();
+        assert_eq!(snapshot.gpus[0].pcie_tx_kb_per_s, Some(111));
+        assert_eq!(snapshot.gpus[0].pcie_rx_kb_per_s, Some(222));
+        let started = std::time::Instant::now();
+        drop(collector);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "drop must join the sampler promptly");
+    }
+
+    #[test]
+    fn skipped_device_keeps_nvml_index_and_advances_internal_timestamp_slot() {
+        let api = fake_api(None);
         let mut collector = super::NvmlCollector::from_api(api).expect("accessible GPU 1");
         collector.uvm_probe.pids = vec![std::process::id()];
         collector.uvm_last_scan = Some(std::time::Instant::now());
