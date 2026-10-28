@@ -1443,11 +1443,13 @@ struct GraphCell<'a> {
     label: &'a str,
     values: Option<&'a VecDeque<f64>>,
     grade: Grade,
-    /// One entry per terminal row, shown to the right of the graph.
+    /// One entry per terminal row, overlaid on the graph's left edge.
     readings: Vec<(String, Rgb)>,
 }
 
 /// Draw several history graphs side by side, sharing the panel width equally.
+/// The label and live readings are overlaid on the top-left of each graph (the
+/// oldest, least interesting samples) so the graph itself uses the whole cell.
 fn push_graph_row(
     frame: &mut String,
     cells: &[GraphCell],
@@ -1456,9 +1458,7 @@ fn push_graph_row(
     color: bool,
     truecolor: bool,
 ) {
-    const LABEL_W: usize = 5;
     const GAP: usize = 2;
-    const MIN_GRAPH: usize = 4;
     let rows = rows.max(1);
     let count = cells.len().max(1);
     let available = inner.saturating_sub(1 + GAP * (count - 1));
@@ -1467,31 +1467,28 @@ fn push_graph_row(
     let mut columns: Vec<Vec<String>> = Vec::with_capacity(cells.len());
     for (i, cell) in cells.iter().enumerate() {
         let cell_w = if i + 1 == count { available - base * (count - 1) } else { base };
-        let wanted = cell.readings.iter().map(|(t, _)| t.chars().count()).max().unwrap_or(0);
-        let value_w = wanted.min(cell_w.saturating_sub(LABEL_W + 1 + MIN_GRAPH));
-        let graph_w = cell_w.saturating_sub(LABEL_W + 1 + value_w).max(1);
-        let graph = history_graph_rows(cell.values, graph_w, rows, cell.grade, color, truecolor);
-        let lines = graph
-            .into_iter()
-            .enumerate()
-            .map(|(row, graph_line)| {
-                let label = if row == 0 {
-                    style(&format!("{:<w$}", cell.label, w = LABEL_W), MUTED, color, truecolor)
-                } else {
-                    " ".repeat(LABEL_W)
-                };
-                let reading = match cell.readings.get(row) {
-                    Some((text, rgb)) => {
-                        let text = truncate(text, value_w);
-                        let pad = value_w.saturating_sub(text.chars().count());
-                        format!("{}{}", style(&text, *rgb, color, truecolor), " ".repeat(pad))
+        let mut grid = graph_cells(cell.values, cell_w, rows, cell.grade);
+        // Keep at least a third of the cell for the graph itself.
+        let max_text = cell_w.saturating_sub(cell_w / 3);
+        for (row, graph_row) in grid.iter_mut().enumerate() {
+            let mut x = 0;
+            let mut put = |text: &str, rgb: Rgb| {
+                for ch in truncate(text, max_text.saturating_sub(x)).chars() {
+                    if x < graph_row.len() {
+                        graph_row[x] = (ch, rgb);
+                        x += 1;
                     }
-                    None => " ".repeat(value_w),
-                };
-                format!("{label}{graph_line} {reading}")
-            })
-            .collect();
-        columns.push(lines);
+                }
+            };
+            if row == 0 {
+                put(cell.label, MUTED);
+                put(" ", MUTED);
+            }
+            if let Some((text, rgb)) = cell.readings.get(row) {
+                put(text, *rgb);
+            }
+        }
+        columns.push(grid.iter().map(|row| cells_to_string(row, color, truecolor)).collect());
     }
 
     for row in 0..rows {
@@ -1506,6 +1503,7 @@ fn push_graph_row(
     }
 }
 
+#[cfg(test)]
 fn history_graph_rows(
     values: Option<&VecDeque<f64>>,
     width: usize,
@@ -1514,6 +1512,34 @@ fn history_graph_rows(
     color: bool,
     truecolor: bool,
 ) -> Vec<String> {
+    graph_cells(values, width, rows, grade)
+        .iter()
+        .map(|row| cells_to_string(row, color, truecolor))
+        .collect()
+}
+
+fn cells_to_string(cells: &[(char, Rgb)], color: bool, truecolor: bool) -> String {
+    let mut line = String::with_capacity(cells.len() * 4 + 32);
+    let mut current: Option<(u8, u8, u8)> = None;
+    for &(ch, rgb) in cells {
+        if color && current != Some((rgb.0, rgb.1, rgb.2)) {
+            line.push_str(&fg(rgb, truecolor));
+            current = Some((rgb.0, rgb.1, rgb.2));
+        }
+        line.push(ch);
+    }
+    if color && current.is_some() {
+        line.push_str(RESET);
+    }
+    line
+}
+
+fn graph_cells(
+    values: Option<&VecDeque<f64>>,
+    width: usize,
+    rows: usize,
+    grade: Grade,
+) -> Vec<Vec<(char, Rgb)>> {
     // Each terminal row contains 8 vertical sub-levels. For multi-row graphs we
     // keep btop-style row grading: color is tied to height bands. In compact
     // one-line mode, switch to per-sample/column grading so the single row still
@@ -1532,48 +1558,32 @@ fn history_graph_rows(
     };
 
     if rows == 1 {
-        let mut line = String::with_capacity(width * 10 + 32);
-        for value in &visible {
-            let level = ((*value / 100.0) * 8.0).round() as usize;
-            let ch = BLOCKS[level.min(8)];
-            if color {
-                line.push_str(&fg(grade_rgb(*value, grade), truecolor));
-                line.push(ch);
-                line.push_str(RESET);
-            } else {
-                line.push(ch);
-            }
-        }
-        return vec![line];
+        return vec![visible
+            .iter()
+            .map(|value| {
+                let level = ((*value / 100.0) * 8.0).round() as usize;
+                (BLOCKS[level.min(8)], grade_rgb(*value, grade))
+            })
+            .collect()];
     }
 
-    let mut output = Vec::with_capacity(rows);
-    for screen_row in 0..rows {
-        // screen_row=0 is the hottest/top band; band_from_bottom=0 is bottom.
-        let band_from_bottom = rows - 1 - screen_row;
-        let band_low = band_from_bottom as f64 * 100.0 / rows as f64;
-        let band_high = (band_from_bottom + 1) as f64 * 100.0 / rows as f64;
-        let band_mid = (band_low + band_high) * 0.5;
-        let row_color = grade_rgb(band_mid, grade);
-
-        let mut line = String::with_capacity(width * 4 + 32);
-        if color {
-            line.push_str(&fg(row_color, truecolor));
-        }
-
-        for value in &visible {
-            let occupancy = ((*value - band_low) / (band_high - band_low)).clamp(0.0, 1.0);
-            let level = (occupancy * 8.0).round() as usize;
-            line.push(BLOCKS[level.min(8)]);
-        }
-
-        if color {
-            line.push_str(RESET);
-        }
-        output.push(line);
-    }
-
-    output
+    (0..rows)
+        .map(|screen_row| {
+            // screen_row=0 is the hottest/top band; band_from_bottom=0 is bottom.
+            let band_from_bottom = rows - 1 - screen_row;
+            let band_low = band_from_bottom as f64 * 100.0 / rows as f64;
+            let band_high = (band_from_bottom + 1) as f64 * 100.0 / rows as f64;
+            let row_color = grade_rgb((band_low + band_high) * 0.5, grade);
+            visible
+                .iter()
+                .map(|value| {
+                    let occupancy = ((*value - band_low) / (band_high - band_low)).clamp(0.0, 1.0);
+                    let level = (occupancy * 8.0).round() as usize;
+                    (BLOCKS[level.min(8)], row_color)
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn grade_rgb(value: f64, grade: Grade) -> Rgb {
@@ -1962,7 +1972,6 @@ mod tests {
         assert_eq!(output.len(), 1);
         let row = &output[0];
         // One-line graphs should color each sample independently.
-        assert_eq!(row.matches("\x1b[0m").count(), 4);
         assert_eq!(row.matches("\x1b[38;").count(), 4);
     }
 
