@@ -1304,13 +1304,12 @@ struct GraphCell<'a> {
     label: &'a str,
     values: Option<&'a VecDeque<f64>>,
     grade: Grade,
-    /// One entry per terminal row, overlaid on the graph's left edge.
+    /// One entry per terminal row, shown in the text column left of the graph.
     readings: Vec<(String, Rgb)>,
 }
 
 /// Draw several history graphs side by side, sharing the panel width equally.
-/// The label and live readings are overlaid on the top-left of each graph (the
-/// oldest, least interesting samples) so the graph itself uses the whole cell.
+/// Each cell has a text column (label and live readings) left of its graph.
 fn push_graph_row(
     frame: &mut String,
     cells: &[GraphCell],
@@ -1328,28 +1327,37 @@ fn push_graph_row(
     let mut columns: Vec<Vec<String>> = Vec::with_capacity(cells.len());
     for (i, cell) in cells.iter().enumerate() {
         let cell_w = if i + 1 == count { available - base * (count - 1) } else { base };
-        let mut grid = graph_cells(cell.values, cell_w, rows, cell.grade);
-        // Keep at least a third of the cell for the graph itself.
-        let max_text = cell_w.saturating_sub(cell_w / 3);
-        for (row, graph_row) in grid.iter_mut().enumerate() {
-            let mut x = 0;
-            let mut put = |text: &str, rgb: Rgb| {
-                for ch in truncate(text, max_text.saturating_sub(x)).chars() {
-                    if x < graph_row.len() {
-                        graph_row[x] = (ch, rgb);
-                        x += 1;
-                    }
-                }
-            };
-            if row == 0 {
-                put(cell.label, MUTED);
-                put(" ", MUTED);
-            }
-            if let Some((text, rgb)) = cell.readings.get(row) {
-                put(text, *rgb);
-            }
+        // Text column on the left (label + live readings), graph to its right.
+        // Text never sits on top of bars, so every graph row starts at the same x.
+        let mut texts: Vec<Vec<(String, Rgb)>> = vec![Vec::new(); rows];
+        texts[0].push((format!("{} ", cell.label), MUTED));
+        for (row, (text, rgb)) in cell.readings.iter().enumerate().take(rows) {
+            texts[row].push((text.clone(), *rgb));
         }
-        columns.push(grid.iter().map(|row| cells_to_string(row, color, truecolor)).collect());
+        let text_w = texts
+            .iter()
+            .map(|parts| parts.iter().map(|(t, _)| t.chars().count()).sum::<usize>())
+            .max()
+            .unwrap_or(0)
+            .min(cell_w / 2);
+        let graph_w = cell_w.saturating_sub(text_w + 1).max(1);
+        let graph = graph_cells(cell.values, graph_w, rows, cell.grade);
+        let lines = graph
+            .iter()
+            .zip(&texts)
+            .map(|(graph_row, parts)| {
+                let mut left = String::new();
+                let mut used = 0;
+                for (text, rgb) in parts {
+                    let text = truncate(text, text_w.saturating_sub(used));
+                    used += text.chars().count();
+                    left.push_str(&style(&text, *rgb, color, truecolor));
+                }
+                left.push_str(&" ".repeat(text_w.saturating_sub(used) + 1));
+                format!("{left}{}", cells_to_string(graph_row, color, truecolor))
+            })
+            .collect();
+        columns.push(lines);
     }
 
     for row in 0..rows {
