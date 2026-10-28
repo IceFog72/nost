@@ -356,42 +356,42 @@ impl Drop for TerminalGuard {
     }
 }
 
+#[derive(Default)]
+struct GpuHistory {
+    gpu: VecDeque<f64>,
+    memory: VecDeque<f64>,
+    power: VecDeque<f64>,
+    thermal: VecDeque<f64>,
+    cap: VecDeque<f64>,
+}
+
 pub struct History {
     max_len: usize,
-    gpu: HashMap<u32, VecDeque<f64>>,
-    memory: HashMap<u32, VecDeque<f64>>,
+    gpus: HashMap<u32, GpuHistory>,
 }
 
 impl History {
     pub fn new(max_len: usize) -> Self {
         Self {
             max_len,
-            gpu: HashMap::new(),
-            memory: HashMap::new(),
+            gpus: HashMap::new(),
         }
     }
 
     pub fn update(&mut self, snapshot: &Snapshot) {
+        let max_len = self.max_len;
         for gpu in &snapshot.gpus {
-            push_bounded(
-                self.gpu.entry(gpu.index).or_default(),
-                gpu.gpu_util.unwrap_or(0) as f64,
-                self.max_len,
-            );
-            push_bounded(
-                self.memory.entry(gpu.index).or_default(),
-                gpu.memory_percent(),
-                self.max_len,
-            );
+            let h = self.gpus.entry(gpu.index).or_default();
+            push_bounded(&mut h.gpu, gpu.gpu_util.unwrap_or(0) as f64, max_len);
+            push_bounded(&mut h.memory, gpu.memory_percent(), max_len);
+            push_bounded(&mut h.power, power_percent(gpu), max_len);
+            push_bounded(&mut h.thermal, temperature_grade(gpu), max_len);
+            push_bounded(&mut h.cap, gpu.clock_limit.as_deref().map_or(0.0, clock_limit_level), max_len);
         }
     }
 
-    fn gpu(&self, index: u32) -> Option<&VecDeque<f64>> {
-        self.gpu.get(&index)
-    }
-
-    fn memory(&self, index: u32) -> Option<&VecDeque<f64>> {
-        self.memory.get(&index)
+    fn series(&self, index: u32, pick: fn(&GpuHistory) -> &VecDeque<f64>) -> Option<&VecDeque<f64>> {
+        self.gpus.get(&index).map(pick)
     }
 }
 
@@ -647,137 +647,84 @@ fn push_gpu_panel(
 
     let inner = width.saturating_sub(2);
 
-    // Current readings live inside the history graph area instead of separate
-    // meter rows. Full-height mode stacks values vertically at the right edge.
-    // When height pressure collapses each graph to one terminal row, combine
-    // the readings on that single row so no important live value disappears.
-    let gpu_percent_plain = gpu
-        .gpu_util
-        .map(|v| format!("{v}%"))
-        .unwrap_or_else(|| "--".into());
-    let temp_plain = gpu
-        .temperature_c
-        .map(|v| format!("{v}°C"))
-        .unwrap_or_else(|| "--".into());
-    let gpu_percent_styled = if color {
-        let rgb = gpu
-            .gpu_util
-            .map_or(MUTED, |v| grade_rgb(v as f64, Grade::Heat));
-        style(&gpu_percent_plain, rgb, color, truecolor)
-    } else {
-        gpu_percent_plain.clone()
-    };
-    let temp_styled = if color {
-        gpu.temperature_c.map_or_else(
-            || style("--", MUTED, color, truecolor),
-            |v| {
-                style(
-                    &format!("{v}°C"),
-                    grade_rgb(temperature_grade(gpu), Grade::Heat),
-                    color,
-                    truecolor,
-                )
-            },
-        )
-    } else {
-        temp_plain.clone()
-    };
+    // Five history graphs: gpu + mem on the first row, power + thermal +
+    // performance-cap reason on the second. Current readings sit to the right
+    // of each graph. Under height pressure every graph collapses to one line.
+    let compact = graph_rows <= 1;
+    let gpu_rgb = gpu.gpu_util.map_or(MUTED, |v| grade_rgb(v as f64, Grade::Heat));
+    let gpu_text = gpu.gpu_util.map_or_else(|| "--".to_string(), |v| format!("{v}%"));
 
     let mem_percent = gpu.memory_percent();
-    let mem_percent_plain = format!("{:.0}%", mem_percent);
-    let mem_used_plain = format_memory_pretty(gpu.memory_used);
-    let mem_used_compact = format_memory_compact(gpu.memory_used);
-    let mem_reserved_plain = gpu
-        .memory_reserved
-        .map(format_memory_pretty)
-        .unwrap_or_else(|| "--".to_string());
-    let mem_reserved_compact = gpu
-        .memory_reserved
-        .map(format_memory_compact)
-        .unwrap_or_else(|| "--".to_string());
-    let mem_usable_plain = format_memory_pretty(gpu.memory_usable());
-    let mem_usable_compact = format_memory_compact(gpu.memory_usable());
-    let mem_percent_styled = if color {
-        style(
-            &mem_percent_plain,
-            grade_rgb(mem_percent, Grade::Memory),
-            color,
-            truecolor,
-        )
+    let mem_text = format!("{mem_percent:.0}%");
+    let mem_rgb = grade_rgb(mem_percent, Grade::Memory);
+    let mem_readings = if compact {
+        vec![(
+            format!(
+                "{mem_text} {}/{}",
+                format_memory_compact(gpu.memory_used),
+                format_memory_compact(gpu.memory_usable())
+            ),
+            mem_rgb,
+        )]
     } else {
-        mem_percent_plain.clone()
+        vec![
+            (mem_text, mem_rgb),
+            (
+                format!(
+                    "reserved {}",
+                    gpu.memory_reserved.map_or_else(|| "--".to_string(), format_memory_pretty)
+                ),
+                AMBER,
+            ),
+            (format!("usable {}", format_memory_pretty(gpu.memory_usable())), MUTED),
+            (format!("used {}", format_memory_pretty(gpu.memory_used)), CYAN),
+        ]
     };
-    let mem_used_styled = style(&mem_used_plain, CYAN, color, truecolor);
-    let mem_used_compact_styled = style(&mem_used_compact, CYAN, color, truecolor);
-    let mem_reserved_styled = style(&mem_reserved_plain, AMBER, color, truecolor);
-    let mem_reserved_compact_styled = style(&mem_reserved_compact, AMBER, color, truecolor);
-    let mem_usable_styled = style(&mem_usable_plain, MUTED, color, truecolor);
-    let mem_usable_compact_styled = style(&mem_usable_compact, MUTED, color, truecolor);
 
-    let (gpu_value_plain, gpu_value_styled, mem_value_plain, mem_value_styled) =
-        if graph_rows <= 1 {
-            (
-                vec![format!("{gpu_percent_plain}  {temp_plain}")],
-                vec![format!("{gpu_percent_styled}  {temp_styled}")],
-                vec![format!(
-                    "{mem_percent_plain} reserved {mem_reserved_compact}/usable {mem_usable_compact}/used {mem_used_compact}"
-                )],
-                vec![format!(
-                    "{mem_percent_styled} reserved {mem_reserved_compact_styled}/usable {mem_usable_compact_styled}/used {mem_used_compact_styled}"
-                )],
-            )
-        } else {
-            (
-                vec![gpu_percent_plain.clone(), temp_plain.clone()],
-                vec![gpu_percent_styled, temp_styled],
-                vec![
-                    mem_percent_plain.clone(),
-                    format!("reserved {mem_reserved_plain}"),
-                    format!("usable {mem_usable_plain}"),
-                    format!("used {mem_used_plain}"),
-                ],
-                vec![
-                    mem_percent_styled,
-                    format!("reserved {mem_reserved_styled}"),
-                    format!("usable {mem_usable_styled}"),
-                    format!("used {mem_used_styled}"),
-                ],
-            )
-        };
+    let power_rgb = grade_rgb(power_percent(gpu), Grade::Heat);
+    let power_readings = match (gpu.power_mw, gpu.power_limit_mw) {
+        (Some(now), Some(limit)) if !compact => vec![
+            (format!("{:.0}W", now as f64 / 1000.0), power_rgb),
+            (format!("of {:.0}W", limit as f64 / 1000.0), MUTED),
+        ],
+        (Some(now), _) => vec![(format!("{:.0}W", now as f64 / 1000.0), power_rgb)],
+        _ => vec![("--".to_string(), MUTED)],
+    };
 
-    // History graphs are vertically graded like btop: color is tied to the
-    // utilization row (low rows cool, high rows hot), not to each time column.
-    let status_width = gpu_value_plain
-        .iter()
-        .chain(mem_value_plain.iter())
-        .map(|value| value.chars().count())
-        .max()
-        .unwrap_or(0);
-    let graph_width = inner
-        .saturating_sub(6 + status_width + 2)
-        .max(12);
-    push_history_graph(
+    let thermal_rgb = grade_rgb(temperature_grade(gpu), Grade::Heat);
+    let mut thermal_readings = vec![(
+        gpu.temperature_c.map_or_else(|| "--".to_string(), |v| format!("{v}°C")),
+        if gpu.temperature_c.is_some() { thermal_rgb } else { MUTED },
+    )];
+    if !compact {
+        if let Some(limit) = gpu.temperature_limit_c() {
+            thermal_readings.push((format!("limit {limit}°C"), MUTED));
+        }
+    }
+
+    let cap_text = gpu.clock_limit.as_deref().unwrap_or("--");
+    let cap_readings = vec![(cap_text.to_string(), clock_limit_color(cap_text))];
+
+    let hist = |pick: fn(&GpuHistory) -> &VecDeque<f64>| history.series(gpu.index, pick);
+    push_graph_row(
         frame,
-        "gpu",
-        history.gpu(gpu.index),
-        graph_width,
+        &[
+            GraphCell { label: "gpu", values: hist(|h| &h.gpu), grade: Grade::Heat, readings: vec![(gpu_text, gpu_rgb)] },
+            GraphCell { label: "mem", values: hist(|h| &h.memory), grade: Grade::Memory, readings: mem_readings },
+        ],
         graph_rows,
-        Grade::Heat,
-        &gpu_value_plain,
-        &gpu_value_styled,
         inner,
         color,
         truecolor,
     );
-    push_history_graph(
+    push_graph_row(
         frame,
-        "mem",
-        history.memory(gpu.index),
-        graph_width,
+        &[
+            GraphCell { label: "power", values: hist(|h| &h.power), grade: Grade::Heat, readings: power_readings },
+            GraphCell { label: "temp", values: hist(|h| &h.thermal), grade: Grade::Heat, readings: thermal_readings },
+            GraphCell { label: "cap", values: hist(|h| &h.cap), grade: Grade::Heat, readings: cap_readings },
+        ],
         graph_rows,
-        Grade::Memory,
-        &mem_value_plain,
-        &mem_value_styled,
         inner,
         color,
         truecolor,
@@ -870,6 +817,29 @@ fn temperature_limit_color(gpu: &GpuSnapshot) -> Rgb {
         grade_rgb(72.0, Grade::Heat)
     } else {
         MUTED
+    }
+}
+
+fn power_percent(gpu: &GpuSnapshot) -> f64 {
+    match (gpu.power_mw, gpu.power_limit_mw) {
+        (Some(now), Some(limit)) if limit > 0 => (now as f64 * 100.0 / limit as f64).clamp(0.0, 100.0),
+        _ => 0.0,
+    }
+}
+
+/// Severity of a clock-limit reason on the 0-100 heat scale: 0 when nothing
+/// holds the clocks back, higher for reasons that cost performance.
+fn clock_limit_level(limit: &str) -> f64 {
+    if limit == "--" || limit == "none" {
+        0.0
+    } else if limit == "idle" {
+        8.0
+    } else if limit.contains("thermal") || limit.contains("power brake") || limit.contains("hw slowdown") {
+        95.0
+    } else if limit.contains("power") {
+        78.0
+    } else {
+        62.0
     }
 }
 
@@ -1453,22 +1423,6 @@ fn push_panel_line(
     }
 }
 
-fn push_panel_lr(
-    frame: &mut String,
-    left: &str,
-    right_plain: &str,
-    right_styled: &str,
-    inner: usize,
-    color: bool,
-    truecolor: bool,
-) {
-    let left_len = visible_len_ansi(left);
-    let right_len = right_plain.chars().count();
-    let gap = inner.saturating_sub(left_len + right_len).max(1);
-    let content = format!("{left}{}{right_styled}", " ".repeat(gap));
-    push_panel_line(frame, &content, inner, color, truecolor);
-}
-
 fn push_plain_line(
     frame: &mut String,
     line: &str,
@@ -1485,47 +1439,70 @@ fn push_plain_line(
     }
 }
 
-fn push_history_graph(
-    frame: &mut String,
-    label: &str,
-    values: Option<&VecDeque<f64>>,
-    width: usize,
-    rows: usize,
+struct GraphCell<'a> {
+    label: &'a str,
+    values: Option<&'a VecDeque<f64>>,
     grade: Grade,
-    value_plain: &[String],
-    value_styled: &[String],
+    /// One entry per terminal row, shown to the right of the graph.
+    readings: Vec<(String, Rgb)>,
+}
+
+/// Draw several history graphs side by side, sharing the panel width equally.
+fn push_graph_row(
+    frame: &mut String,
+    cells: &[GraphCell],
+    rows: usize,
     inner: usize,
     color: bool,
     truecolor: bool,
 ) {
+    const LABEL_W: usize = 5;
+    const GAP: usize = 2;
+    const MIN_GRAPH: usize = 4;
     let rows = rows.max(1);
-    let rendered = history_graph_rows(values, width, rows, grade, color, truecolor);
+    let count = cells.len().max(1);
+    let available = inner.saturating_sub(1 + GAP * (count - 1));
+    let base = available / count;
 
-    for (screen_row, graph_row) in rendered.into_iter().enumerate() {
-        // Keep the graph label on the first row, but allow current readings to
-        // occupy multiple rows at the right edge of the graph.
-        let prefix = if screen_row == 0 {
-            if color {
-                format!(" {}{label}{RESET}  ", fg(MUTED, truecolor))
-            } else {
-                format!(" {label}  ")
+    let mut columns: Vec<Vec<String>> = Vec::with_capacity(cells.len());
+    for (i, cell) in cells.iter().enumerate() {
+        let cell_w = if i + 1 == count { available - base * (count - 1) } else { base };
+        let wanted = cell.readings.iter().map(|(t, _)| t.chars().count()).max().unwrap_or(0);
+        let value_w = wanted.min(cell_w.saturating_sub(LABEL_W + 1 + MIN_GRAPH));
+        let graph_w = cell_w.saturating_sub(LABEL_W + 1 + value_w).max(1);
+        let graph = history_graph_rows(cell.values, graph_w, rows, cell.grade, color, truecolor);
+        let lines = graph
+            .into_iter()
+            .enumerate()
+            .map(|(row, graph_line)| {
+                let label = if row == 0 {
+                    style(&format!("{:<w$}", cell.label, w = LABEL_W), MUTED, color, truecolor)
+                } else {
+                    " ".repeat(LABEL_W)
+                };
+                let reading = match cell.readings.get(row) {
+                    Some((text, rgb)) => {
+                        let text = truncate(text, value_w);
+                        let pad = value_w.saturating_sub(text.chars().count());
+                        format!("{}{}", style(&text, *rgb, color, truecolor), " ".repeat(pad))
+                    }
+                    None => " ".repeat(value_w),
+                };
+                format!("{label}{graph_line} {reading}")
+            })
+            .collect();
+        columns.push(lines);
+    }
+
+    for row in 0..rows {
+        let mut line = String::from(" ");
+        for (i, column) in columns.iter().enumerate() {
+            if i > 0 {
+                line.push_str(&" ".repeat(GAP));
             }
-        } else {
-            "      ".to_string()
-        };
-        let line = format!("{prefix}{graph_row}");
-        match (value_plain.get(screen_row), value_styled.get(screen_row)) {
-            (Some(plain), Some(styled)) => push_panel_lr(
-                frame,
-                &line,
-                plain,
-                styled,
-                inner,
-                color,
-                truecolor,
-            ),
-            _ => push_panel_line(frame, &line, inner, color, truecolor),
+            line.push_str(&column[row]);
         }
+        push_panel_line(frame, &line, inner, color, truecolor);
     }
 }
 
