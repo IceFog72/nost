@@ -35,6 +35,8 @@ const NVML_CLOCK_EVENT_REASON_SW_THERMAL: u64 = 0x0000_0000_0000_0020;
 const NVML_CLOCK_EVENT_REASON_HW_THERMAL: u64 = 0x0000_0000_0000_0040;
 const NVML_CLOCK_EVENT_REASON_HW_POWER_BRAKE: u64 = 0x0000_0000_0000_0080;
 const NVML_CLOCK_EVENT_REASON_DISPLAY_CLOCK: u64 = 0x0000_0000_0000_0100;
+const NVML_CLOCK_EVENT_REASON_BOARD_LIMIT: u64 = 0x0000_0000_0000_0200;
+const NVML_CLOCK_EVENT_REASON_RELIABILITY: u64 = 0x0000_0000_0000_0400;
 const NVML_CLOCK_EVENT_REASON_KNOWN: u64 =
     NVML_CLOCK_EVENT_REASON_GPU_IDLE
         | NVML_CLOCK_EVENT_REASON_APPLICATION_CLOCKS
@@ -44,7 +46,9 @@ const NVML_CLOCK_EVENT_REASON_KNOWN: u64 =
         | NVML_CLOCK_EVENT_REASON_SW_THERMAL
         | NVML_CLOCK_EVENT_REASON_HW_THERMAL
         | NVML_CLOCK_EVENT_REASON_HW_POWER_BRAKE
-        | NVML_CLOCK_EVENT_REASON_DISPLAY_CLOCK;
+        | NVML_CLOCK_EVENT_REASON_DISPLAY_CLOCK
+        | NVML_CLOCK_EVENT_REASON_BOARD_LIMIT
+        | NVML_CLOCK_EVENT_REASON_RELIABILITY;
 
 const RTLD_NOW: c_int = 2;
 const RTLD_LOCAL: c_int = 0;
@@ -982,6 +986,8 @@ fn format_clock_limit(mask: u64) -> String {
     push(NVML_CLOCK_EVENT_REASON_SYNC_BOOST, "sync");
     push(NVML_CLOCK_EVENT_REASON_APPLICATION_CLOCKS, "app clocks");
     push(NVML_CLOCK_EVENT_REASON_DISPLAY_CLOCK, "display");
+    push(NVML_CLOCK_EVENT_REASON_BOARD_LIMIT, "board limit");
+    push(NVML_CLOCK_EVENT_REASON_RELIABILITY, "reliability");
 
     let unknown = mask & !NVML_CLOCK_EVENT_REASON_KNOWN;
     if unknown != 0 {
@@ -1127,7 +1133,7 @@ fn memory_value(value: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DrmStatus, format_clock_limit, classify_drm_status, normalize_memory_v2, residual_vram, NvmlMemory, NvmlMemoryV2, NvmlPciInfo, NvmlProcessInfo, NvmlProcessUtilizationSample, NvmlUtilization, NVML_CLOCK_EVENT_REASON_GPU_IDLE, NVML_CLOCK_EVENT_REASON_HW_THERMAL, NVML_CLOCK_EVENT_REASON_SW_POWER_CAP};
+    use super::{DrmStatus, format_clock_limit, classify_drm_status, normalize_memory_v2, residual_vram, NvmlMemory, NvmlMemoryV2, NvmlPciInfo, NvmlProcessInfo, NvmlProcessUtilizationSample, NvmlUtilization, NVML_CLOCK_EVENT_REASON_BOARD_LIMIT, NVML_CLOCK_EVENT_REASON_GPU_IDLE, NVML_CLOCK_EVENT_REASON_HW_THERMAL, NVML_CLOCK_EVENT_REASON_RELIABILITY, NVML_CLOCK_EVENT_REASON_SW_POWER_CAP};
     use std::mem::{align_of, size_of};
 
     unsafe extern "C" fn fake_shutdown() -> i32 { 0 }
@@ -1287,6 +1293,8 @@ mod tests {
     fn clock_limit_decoding_prefers_actionable_reasons() {
         assert_eq!(format_clock_limit(0), "none");
         assert_eq!(format_clock_limit(NVML_CLOCK_EVENT_REASON_GPU_IDLE), "idle");
+        assert_eq!(format_clock_limit(NVML_CLOCK_EVENT_REASON_RELIABILITY), "reliability");
+        assert_eq!(format_clock_limit(NVML_CLOCK_EVENT_REASON_BOARD_LIMIT), "board limit");
         assert_eq!(
             format_clock_limit(
                 NVML_CLOCK_EVENT_REASON_GPU_IDLE

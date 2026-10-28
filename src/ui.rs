@@ -668,7 +668,7 @@ fn push_gpu_panel(
     }];
 
     let cap_text = gpu.clock_limit.as_deref().unwrap_or("--");
-    let cap_readings = vec![(cap_text.to_string(), clock_limit_color(cap_text))];
+    let cap_readings = vec![(cap_label(cap_text), clock_limit_color(cap_text))];
 
     let hist = |pick: fn(&GpuHistory) -> &VecDeque<f64>| history.series(gpu.index, pick);
     let top_cells = [
@@ -784,7 +784,9 @@ fn cap_category(limit: &str) -> u8 {
         "sync" => 7,
         "app clocks" => 8,
         "display" => 9,
-        _ => 10,
+        "reliability" => 10,
+        "board limit" => 11,
+        _ => 12,
     }
 }
 
@@ -800,8 +802,26 @@ fn cap_color(category: u8) -> Rgb {
         7 => Rgb(150, 160, 255),
         8 => CYAN,
         9 => Rgb(96, 224, 190),
+        10 => Rgb(255, 214, 64),
+        11 => Rgb(255, 128, 160),
         _ => MUTED,
     }
+}
+
+/// GPU-Z style short names for the reasons NVML reports.
+fn cap_label(limit: &str) -> String {
+    limit
+        .split('+')
+        .map(|reason| match reason {
+            "power" => "Pwr",
+            "thermal" | "hw thermal" => "Thrm",
+            "reliability" => "VRel",
+            "board limit" => "Board",
+            "idle" => "Idle",
+            other => other,
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 fn clock_limit_color(limit: &str) -> Rgb {
@@ -1917,7 +1937,7 @@ mod tests {
         use super::{cap_category, cap_color};
         assert_eq!(cap_category("none"), 0);
         assert_eq!(cap_category("power+thermal"), cap_category("power"));
-        let reasons = ["idle", "power", "thermal", "hw thermal", "power brake", "hw slowdown", "sync", "app clocks", "display", "other"];
+        let reasons = ["idle", "power", "thermal", "hw thermal", "power brake", "hw slowdown", "sync", "app clocks", "display", "reliability", "board limit", "other"];
         let colors: Vec<(u8, u8, u8)> = reasons
             .iter()
             .map(|r| {
