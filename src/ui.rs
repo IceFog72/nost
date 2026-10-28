@@ -650,57 +650,34 @@ fn push_gpu_panel(
     // Five history graphs: gpu + mem on the first row, power + thermal +
     // performance-cap reason on the second. Current readings sit to the right
     // of each graph. Under height pressure every graph collapses to one line.
-    let compact = graph_rows <= 1;
     let gpu_rgb = gpu.gpu_util.map_or(MUTED, |v| grade_rgb(v as f64, Grade::Heat));
     let gpu_text = gpu.gpu_util.map_or_else(|| "--".to_string(), |v| format!("{v}%"));
 
+    // One short reading per graph, overlaid next to its label.
     let mem_percent = gpu.memory_percent();
-    let mem_text = format!("{mem_percent:.0}%");
-    let mem_rgb = grade_rgb(mem_percent, Grade::Memory);
-    let mem_readings = if compact {
-        vec![(
-            format!(
-                "{mem_text} {}/{}",
-                format_memory_compact(gpu.memory_used),
-                format_memory_compact(gpu.memory_usable())
-            ),
-            mem_rgb,
-        )]
-    } else {
-        vec![
-            (mem_text, mem_rgb),
-            (
-                format!(
-                    "reserved {}",
-                    gpu.memory_reserved.map_or_else(|| "--".to_string(), format_memory_pretty)
-                ),
-                AMBER,
-            ),
-            (format!("usable {}", format_memory_pretty(gpu.memory_usable())), MUTED),
-            (format!("used {}", format_memory_pretty(gpu.memory_used)), CYAN),
-        ]
-    };
+    let mem_readings = vec![(
+        format!(
+            "{mem_percent:.0}% {}/{}",
+            format_memory_compact(gpu.memory_used),
+            format_memory_compact(gpu.memory_usable())
+        ),
+        grade_rgb(mem_percent, Grade::Memory),
+    )];
 
     let power_rgb = grade_rgb(power_percent(gpu), Grade::Heat);
-    let power_readings = match (gpu.power_mw, gpu.power_limit_mw) {
-        (Some(now), Some(limit)) if !compact => vec![
-            (format!("{:.0}W", now as f64 / 1000.0), power_rgb),
-            (format!("of {:.0}W", limit as f64 / 1000.0), MUTED),
-        ],
-        (Some(now), _) => vec![(format!("{:.0}W", now as f64 / 1000.0), power_rgb)],
-        _ => vec![("--".to_string(), MUTED)],
-    };
+    let power_readings = vec![match (gpu.power_mw, gpu.power_limit_mw) {
+        (Some(now), Some(limit)) => (
+            format!("{:.0}W/{:.0}W", now as f64 / 1000.0, limit as f64 / 1000.0),
+            power_rgb,
+        ),
+        (Some(now), None) => (format!("{:.0}W", now as f64 / 1000.0), power_rgb),
+        _ => ("--".to_string(), MUTED),
+    }];
 
-    let thermal_rgb = grade_rgb(temperature_grade(gpu), Grade::Heat);
-    let mut thermal_readings = vec![(
-        gpu.temperature_c.map_or_else(|| "--".to_string(), |v| format!("{v}°C")),
-        if gpu.temperature_c.is_some() { thermal_rgb } else { MUTED },
-    )];
-    if !compact {
-        if let Some(limit) = gpu.temperature_limit_c() {
-            thermal_readings.push((format!("limit {limit}°C"), MUTED));
-        }
-    }
+    let thermal_readings = vec![match gpu.temperature_c {
+        Some(v) => (format!("{v}°C"), grade_rgb(temperature_grade(gpu), Grade::Heat)),
+        None => ("--".to_string(), MUTED),
+    }];
 
     let cap_text = gpu.clock_limit.as_deref().unwrap_or("--");
     let cap_readings = vec![(cap_text.to_string(), clock_limit_color(cap_text))];
