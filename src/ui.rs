@@ -29,6 +29,90 @@ const SYNC_END: &str = "\x1b[?2026l";
 // has been rendered yet. This is only touched by the single render thread.
 static LAST_TERMINAL_SIZE: AtomicU32 = AtomicU32::new(0);
 
+// 1-based terminal row of the process table header, or 0 when it is not
+// drawn. Written by the renderer, read by the mouse parser so clicks can be
+// mapped to columns. Both run on the same thread.
+static PROCESS_HEADER_ROW: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SortColumn {
+    Gpu,
+    Pid,
+    User,
+    Kind,
+    Name,
+    Util,
+    Memory,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessSort {
+    pub column: SortColumn,
+    pub descending: bool,
+}
+
+impl ProcessSort {
+    /// Clicking a new column sorts by it (numbers biggest-first, text A-Z);
+    /// clicking the active column reverses the direction.
+    pub fn clicked(current: Option<Self>, column: SortColumn) -> Self {
+        match current {
+            Some(sort) if sort.column == column => Self {
+                column,
+                descending: !sort.descending,
+            },
+            _ => Self {
+                column,
+                descending: matches!(column, SortColumn::Util | SortColumn::Memory),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Input {
+    Key(u8),
+    Sort(SortColumn),
+}
+
+fn sort_processes(processes: &[ProcessSnapshot], sort: ProcessSort) -> Vec<ProcessSnapshot> {
+    let mut sorted = processes.to_vec();
+    sorted.sort_by(|a, b| {
+        let primary = match sort.column {
+            SortColumn::Gpu => a.gpu_index.cmp(&b.gpu_index),
+            SortColumn::Pid => a.pid.cmp(&b.pid),
+            SortColumn::User => a.user.to_lowercase().cmp(&b.user.to_lowercase()),
+            SortColumn::Kind => a.kind.short().cmp(b.kind.short()),
+            SortColumn::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            SortColumn::Util => a.gpu_util.cmp(&b.gpu_util),
+            SortColumn::Memory => a.memory_bytes.cmp(&b.memory_bytes),
+        };
+        let primary = if sort.descending { primary.reverse() } else { primary };
+        primary.then_with(|| a.pid.cmp(&b.pid)).then_with(|| a.gpu_index.cmp(&b.gpu_index))
+    });
+    sorted
+}
+
+fn process_header_hit(column: usize, inner: usize) -> Option<SortColumn> {
+    // Content starts after the left border, i.e. at 1-based column 2.
+    let c = process_columns(inner);
+    let mut start = 2;
+    for (width, id) in [
+        (c.gpu, SortColumn::Gpu),
+        (c.pid, SortColumn::Pid),
+        (c.user, SortColumn::User),
+        (c.kind, SortColumn::Kind),
+        (c.name, SortColumn::Name),
+        (c.util, SortColumn::Util),
+        (c.memory, SortColumn::Memory),
+    ] {
+        if column >= start && column < start + width {
+            return Some(id);
+        }
+        start += width;
+    }
+    None
+}
+
 #[derive(Clone, Copy)]
 struct Rgb(u8, u8, u8);
 
@@ -129,7 +213,7 @@ impl TerminalGuard {
         Ok(())
     }
 
-    pub fn read_key(&mut self, interval_ms: u64) -> io::Result<Option<u8>> {
+    pub fn read_key(&mut self, interval_ms: u64) -> io::Result<Option<Input>> {
         if self.original_stdin.is_none() {
             return Ok(None);
         }
@@ -152,12 +236,12 @@ impl TerminalGuard {
     }
 }
 
-fn parse_interval_input(input: &mut Vec<u8>, interval_ms: u64, width: usize) -> Option<u8> {
+fn parse_interval_input(input: &mut Vec<u8>, interval_ms: u64, width: usize) -> Option<Input> {
     while !input.is_empty() {
         match input[0] {
             key @ (b'-' | b'_' | b'+' | b'=' | b'q' | b'Q') => {
                 input.remove(0);
-                return Some(key);
+                return Some(Input::Key(key));
             }
             b'\x1b' if input.len() < 3 => return None,
             b'\x1b' if input.starts_with(b"\x1b[<") => {
@@ -184,16 +268,26 @@ fn parse_interval_input(input: &mut Vec<u8>, interval_ms: u64, width: usize) -> 
                 else {
                     continue;
                 };
-                if fields.next().is_some() || button & 3 != 0 || button & 64 != 0 || row != 1 {
+                if fields.next().is_some() || button & 3 != 0 || button & 64 != 0 {
+                    continue;
+                }
+                let header_row = PROCESS_HEADER_ROW.load(Ordering::Relaxed) as usize;
+                if header_row != 0 && row == header_row {
+                    if let Some(column) = process_header_hit(column, width.saturating_sub(2)) {
+                        return Some(Input::Sort(column));
+                    }
+                    continue;
+                }
+                if row != 1 {
                     continue;
                 }
                 let plus = width.saturating_sub(3);
                 let minus = plus.saturating_sub(interval_ms.to_string().len() + 5);
                 if column.abs_diff(plus) <= 1 {
-                    return Some(b'+');
+                    return Some(Input::Key(b'+'));
                 }
                 if column.abs_diff(minus) <= 1 {
-                    return Some(b'-');
+                    return Some(Input::Key(b'-'));
                 }
             }
             _ => {
@@ -354,8 +448,10 @@ pub fn render(
     history: &History,
     interval_ms: u64,
     _backend_label: &str,
+    sort: Option<ProcessSort>,
     color: bool,
 ) -> io::Result<()> {
+    PROCESS_HEADER_ROW.store(0, Ordering::Relaxed);
     let (terminal_width, terminal_height) = terminal_size();
     let terminal_width = terminal_width as usize;
     let terminal_height = terminal_height as usize;
@@ -463,6 +559,7 @@ pub fn render(
             width,
             process_budget.min(remaining),
             vertical_layout.ultra_compact,
+            sort,
             color,
             truecolor,
         );
@@ -933,15 +1030,25 @@ fn push_panel_columns(
     push_panel_line(frame, &line, inner, color, truecolor);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_process_panel(
     frame: &mut String,
     processes: &[ProcessSnapshot],
     width: usize,
     available_lines: usize,
     ultra_compact: bool,
+    sort: Option<ProcessSort>,
     color: bool,
     truecolor: bool,
 ) {
+    let sorted;
+    let processes = match sort {
+        Some(sort) => {
+            sorted = sort_processes(processes, sort);
+            &sorted[..]
+        }
+        None => processes,
+    };
     let title_plain = format!("processes  {} active", processes.len());
     let title_styled = if color {
         format!(
@@ -958,7 +1065,9 @@ fn push_process_panel(
     let inner = width.saturating_sub(2);
     let columns = process_columns(inner);
     if !ultra_compact {
-        let header = process_header(&columns, color, truecolor);
+        // Header sits one line below the top border (both 1-based rows).
+        PROCESS_HEADER_ROW.store(count_newlines(frame) as u32 + 1, Ordering::Relaxed);
+        let header = process_header(&columns, sort, color, truecolor);
         push_panel_line(frame, &header, inner, color, truecolor);
     }
 
@@ -1204,10 +1313,27 @@ fn process_columns(inner: usize) -> ProcessColumns {
     }
 }
 
-fn process_header(c: &ProcessColumns, color: bool, truecolor: bool) -> String {
+fn process_header(
+    c: &ProcessColumns,
+    sort: Option<ProcessSort>,
+    color: bool,
+    truecolor: bool,
+) -> String {
+    let label = |text: &str, column: SortColumn| match sort {
+        Some(s) if s.column == column => {
+            format!("{text} {}", if s.descending { '▼' } else { '▲' })
+        }
+        _ => text.to_string(),
+    };
     let plain = format!(
         "{:<gw$}{:<pw$}{:<uw$}{:<kw$}{:<nw$}{:>xw$}{:>mw$}",
-        " GPU", "PID", "USER", "TYPE", "PROCESS", "GPU%", "VRAM",
+        label(" GPU", SortColumn::Gpu),
+        label("PID", SortColumn::Pid),
+        label("USER", SortColumn::User),
+        label("TYPE", SortColumn::Kind),
+        label("PROCESS", SortColumn::Name),
+        label("GPU%", SortColumn::Util),
+        label("VRAM", SortColumn::Memory),
         gw = c.gpu,
         pw = c.pid,
         uw = c.user,
@@ -1682,7 +1808,7 @@ pub fn should_use_color(force_no_color: bool) -> bool {
 mod tests {
     use super::{
         choose_vertical_layout, format_memory_compact, format_memory_pretty, format_pcie_rate, grade_rgb,
-        history_graph_rows, parse_interval_input, terminal_size_key, truncate,
+        history_graph_rows, parse_interval_input, process_header_hit, sort_processes, Input, ProcessSort, SortColumn, terminal_size_key, truncate,
         visible_len_ansi, Grade,
     };
     use std::collections::VecDeque;
@@ -1783,20 +1909,62 @@ mod tests {
     #[test]
     fn quit_key_is_reported() {
         let mut input = b"xq".to_vec();
-        assert_eq!(parse_interval_input(&mut input, 500, 79), Some(b'q'));
+        assert_eq!(parse_interval_input(&mut input, 500, 79), Some(Input::Key(b'q')));
         assert!(input.is_empty());
     }
 
     #[test]
     fn mouse_clicks_hit_interval_buttons_only() {
         let mut plus = b"\x1b[<0;76;1M".to_vec();
-        assert_eq!(parse_interval_input(&mut plus, 500, 79), Some(b'+'));
+        assert_eq!(parse_interval_input(&mut plus, 500, 79), Some(Input::Key(b'+')));
 
         let mut minus = b"\x1b[<0;68;1M".to_vec();
-        assert_eq!(parse_interval_input(&mut minus, 500, 79), Some(b'-'));
+        assert_eq!(parse_interval_input(&mut minus, 500, 79), Some(Input::Key(b'-')));
 
         let mut outside = b"\x1b[<0;60;1M".to_vec();
         assert_eq!(parse_interval_input(&mut outside, 500, 79), None);
+    }
+
+    #[test]
+    fn header_clicks_select_sort_columns() {
+        use crate::ui::PROCESS_HEADER_ROW;
+        PROCESS_HEADER_ROW.store(14, std::sync::atomic::Ordering::Relaxed);
+        // width 79 -> inner 77; PID spans 1-based columns 7..16.
+        let mut pid = b"\x1b[<0;8;14M".to_vec();
+        assert_eq!(parse_interval_input(&mut pid, 500, 79), Some(Input::Sort(SortColumn::Pid)));
+        let mut vram = b"\x1b[<0;77;14M".to_vec();
+        assert_eq!(parse_interval_input(&mut vram, 500, 79), Some(Input::Sort(SortColumn::Memory)));
+        let mut body = b"\x1b[<0;8;15M".to_vec();
+        assert_eq!(parse_interval_input(&mut body, 500, 79), None);
+        PROCESS_HEADER_ROW.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert!(process_header_hit(1, 77).is_none());
+    }
+
+    #[test]
+    fn sorting_toggles_and_orders_processes() {
+        let first = ProcessSort::clicked(None, SortColumn::Memory);
+        assert!(first.descending);
+        let flipped = ProcessSort::clicked(Some(first), SortColumn::Memory);
+        assert!(!flipped.descending);
+        assert!(!ProcessSort::clicked(Some(first), SortColumn::Name).descending);
+
+        let snapshot = crate::demo::DemoCollector::new().collect();
+        let sorted = sort_processes(&snapshot.processes, first);
+        assert!(sorted.windows(2).all(|w| w[0].memory_bytes >= w[1].memory_bytes));
+        let sorted = sort_processes(&snapshot.processes, ProcessSort { column: SortColumn::Pid, descending: false });
+        assert!(sorted.windows(2).all(|w| w[0].pid <= w[1].pid));
+    }
+
+    #[test]
+    fn sorted_header_shows_arrow() {
+        let header = super::process_header(
+            &super::process_columns(77),
+            Some(ProcessSort { column: SortColumn::Util, descending: true }),
+            false,
+            false,
+        );
+        assert!(header.contains("GPU% ▼"));
+        assert!(!header.contains('▲'));
     }
 
     #[test]

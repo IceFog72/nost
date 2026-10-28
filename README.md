@@ -114,7 +114,7 @@ Default refresh is 500 ms.
 
 The JSON schema is versioned by its "schema" field; fields NVML cannot provide are null.
 
-While nost is running, press or left-click `-` or `+` to change the refresh interval by 100 ms. The current interval appears in the first GPU panel's top-right corner. The allowed range is 100 ms to 60 seconds. Hold Shift while dragging to select terminal text. Ctrl-Z suspends nost and restores the terminal; `fg` resumes the dashboard. Press `q` (or Ctrl-C) to quit.
+While nost is running, press or left-click `-` or `+` to change the refresh interval by 100 ms. The current interval appears in the first GPU panel's top-right corner. The allowed range is 100 ms to 60 seconds. Hold Shift while dragging to select terminal text. Ctrl-Z suspends nost and restores the terminal; `fg` resumes the dashboard. Press `q` (or Ctrl-C) to quit. Left-click a column header in the processes table to sort by it; click again to reverse (▲ ascending, ▼ descending).
 
 ## Architecture
 

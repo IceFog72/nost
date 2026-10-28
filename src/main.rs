@@ -161,6 +161,7 @@ where
     F: FnMut() -> model::Snapshot,
 {
     let mut interval = config.interval;
+    let mut sort: Option<ui::ProcessSort> = None;
     while RUNNING.load(Ordering::Relaxed) {
         // Consume the resize wake-up that brought us here. A new SIGWINCH that
         // arrives during collection/rendering will set the flag again and keep
@@ -177,6 +178,7 @@ where
             history,
             interval.as_millis().min(u64::MAX as u128) as u64,
             backend,
+            sort,
             color,
         )
         .map_err(|error| format!("terminal write failed: {error}"))?;
@@ -191,7 +193,7 @@ where
 
         let elapsed = frame_started.elapsed();
         if elapsed < interval {
-            sleep_interruptible(interval - elapsed, terminal, &mut interval)?;
+            sleep_interruptible(interval - elapsed, terminal, &mut interval, &mut sort)?;
         }
     }
     Ok(())
@@ -201,6 +203,7 @@ fn sleep_interruptible(
     duration: Duration,
     terminal: &mut TerminalGuard,
     interval: &mut Duration,
+    sort: &mut Option<ui::ProcessSort>,
 ) -> Result<(), String> {
     let deadline = Instant::now() + duration;
     while RUNNING.load(Ordering::Relaxed) {
@@ -219,6 +222,13 @@ fn sleep_interruptible(
             .read_key(interval.as_millis().min(u64::MAX as u128) as u64)
             .map_err(|error| format!("terminal input failed: {error}"))?
         {
+            let key = match key {
+                ui::Input::Key(key) => key,
+                ui::Input::Sort(column) => {
+                    *sort = Some(ui::ProcessSort::clicked(*sort, column));
+                    break;
+                }
+            };
             if is_quit_key(key) {
                 RUNNING.store(false, Ordering::Relaxed);
                 break;
@@ -306,7 +316,7 @@ Options:\n  -i, --interval SECONDS  refresh interval (default: 0.5)\n\
       --json              print one snapshot as JSON and exit\n\
   -h, --help              show this help\n\
   -V, --version           show version\n\n\
-Input:\n  - / +                 decrease / increase refresh interval by 100 ms\n  left-click - / +      decrease / increase refresh interval by 100 ms\n  Ctrl-Z                suspend (resume with fg)\n  q                     quit\n  Ctrl-C                quit"
+Input:\n  - / +                 decrease / increase refresh interval by 100 ms\n  left-click - / +      decrease / increase refresh interval by 100 ms\n  click process header  sort by that column; click again to reverse (▲ / ▼)\n  Ctrl-Z                suspend (resume with fg)\n  q                     quit\n  Ctrl-C                quit"
     );
 }
 
