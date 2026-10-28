@@ -1355,9 +1355,9 @@ fn graph_separator_columns(inner: usize, count: usize) -> Vec<usize> {
     widths[..widths.len() - 1]
         .iter()
         .map(|w| {
-            x += w + 1;
-            let column = x - 1;
-            x += 2;
+            // cell, one space, then the rule; the next cell starts after " │ ".
+            let column = x + w + 1;
+            x = column + 2;
             column
         })
         .collect()
@@ -1776,6 +1776,34 @@ mod tests {
         let output = history_graph_rows(Some(&values), 7, 4, Grade::Heat, true, true);
         assert_eq!(output.len(), 4);
         assert!(output.iter().all(|row| visible_len_ansi(row) == 7));
+    }
+
+    #[test]
+    fn graph_dividers_line_up_with_vertical_rules() {
+        let snapshot = crate::demo::DemoCollector::new().collect();
+        let mut history = super::History::new(240);
+        history.update(&snapshot);
+        for width in [64usize, 80, 99, 119] {
+            let mut frame = String::new();
+            super::push_gpu_panel(&mut frame, &snapshot.gpus[0], &history, width, 4, false, None, false, true);
+            let rows: Vec<Vec<char>> = frame.lines().map(|row| row.chars().collect()).collect();
+            let divider = rows.iter().position(|row| row[0] == '├').expect("divider row");
+            // rows[1..divider] have 2 graphs, rows[divider + 1..] have 3.
+            for (range, count) in [(1..divider, 2), (divider + 1..divider + 5, 3)] {
+                let columns = super::graph_separator_columns(width - 2, count);
+                for row in &rows[range] {
+                    for &column in &columns {
+                        assert_eq!(row[column + 1], '│', "{width}: {}", row.iter().collect::<String>());
+                    }
+                }
+            }
+            for &column in &super::graph_separator_columns(width - 2, 2) {
+                assert!(matches!(rows[divider][column + 1], '┴' | '┼'));
+            }
+            for &column in &super::graph_separator_columns(width - 2, 3) {
+                assert!(matches!(rows[divider][column + 1], '┬' | '┼'));
+            }
+        }
     }
 
     #[test]
