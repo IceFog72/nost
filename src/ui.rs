@@ -503,7 +503,7 @@ pub fn render(
     let gpu_panel_lines = if vertical_layout.ultra_compact {
         2usize + vertical_layout.graph_rows * 2
     } else {
-        3usize + vertical_layout.graph_rows * 2
+        4usize + vertical_layout.graph_rows * 2
     };
     let process_min_lines = if vertical_layout.ultra_compact { 5usize } else { 6usize };
     let holders_min_lines = if vertical_layout.show_holders {
@@ -694,6 +694,9 @@ fn push_gpu_panel(
         color,
         truecolor,
     );
+    if !ultra_compact {
+        push_graph_divider(frame, 2, 3, inner, color, truecolor);
+    }
     push_graph_row(
         frame,
         &[
@@ -1295,58 +1298,94 @@ fn push_graph_row(
     color: bool,
     truecolor: bool,
 ) {
-    const GAP: usize = 2;
     let rows = rows.max(1);
-    let count = cells.len().max(1);
-    let available = inner.saturating_sub(1 + GAP * (count - 1));
-    let base = available / count;
+    let widths = graph_cell_widths(inner, cells.len());
+    let separator = style(" │ ", BORDER, color, truecolor);
 
     let mut columns: Vec<Vec<String>> = Vec::with_capacity(cells.len());
-    for (i, cell) in cells.iter().enumerate() {
-        let cell_w = if i + 1 == count { available - base * (count - 1) } else { base };
-        // Text column on the left (label + live readings), graph to its right.
-        // Text never sits on top of bars, so every graph row starts at the same x.
-        let mut texts: Vec<Vec<(String, Rgb)>> = vec![Vec::new(); rows];
-        texts[0].push((format!("{} ", cell.label), MUTED));
-        for (row, (text, rgb)) in cell.readings.iter().enumerate().take(rows) {
-            texts[row].push((text.clone(), *rgb));
-        }
-        let text_w = texts
-            .iter()
-            .map(|parts| parts.iter().map(|(t, _)| t.chars().count()).sum::<usize>())
-            .max()
-            .unwrap_or(0)
-            .min(cell_w / 2);
-        let graph_w = cell_w.saturating_sub(text_w + 1).max(1);
-        let graph = graph_cells(cell.values, graph_w, rows, cell.grade);
-        let lines = graph
-            .iter()
-            .zip(&texts)
-            .map(|(graph_row, parts)| {
-                let mut left = String::new();
-                let mut used = 0;
-                for (text, rgb) in parts {
-                    let text = truncate(text, text_w.saturating_sub(used));
-                    used += text.chars().count();
-                    left.push_str(&style(&text, *rgb, color, truecolor));
+    for (cell, &cell_w) in cells.iter().zip(&widths) {
+        let mut grid = graph_cells(cell.values, cell_w, rows, cell.grade);
+        // Label and reading are drawn over the top-left corner of the graph,
+        // where the oldest samples are.
+        let max_text = cell_w.saturating_sub(cell_w / 3);
+        let mut x = 0;
+        let mut put = |text: &str, rgb: Rgb| {
+            for ch in truncate(text, max_text.saturating_sub(x)).chars() {
+                if x < grid[0].len() {
+                    grid[0][x] = (ch, rgb);
+                    x += 1;
                 }
-                left.push_str(&" ".repeat(text_w.saturating_sub(used) + 1));
-                format!("{left}{}", cells_to_string(graph_row, color, truecolor))
-            })
-            .collect();
-        columns.push(lines);
+            }
+        };
+        put(cell.label, MUTED);
+        put(" ", MUTED);
+        if let Some((text, rgb)) = cell.readings.first() {
+            put(text, *rgb);
+        }
+        columns.push(grid.iter().map(|row| cells_to_string(row, color, truecolor)).collect());
     }
 
     for row in 0..rows {
         let mut line = String::from(" ");
         for (i, column) in columns.iter().enumerate() {
             if i > 0 {
-                line.push_str(&" ".repeat(GAP));
+                line.push_str(&separator);
             }
             line.push_str(&column[row]);
         }
         push_panel_line(frame, &line, inner, color, truecolor);
     }
+}
+
+/// Cell widths for `count` graphs: a leading space, then cells joined by
+/// 3-column separators (" │ ").
+fn graph_cell_widths(inner: usize, count: usize) -> Vec<usize> {
+    let count = count.max(1);
+    let available = inner.saturating_sub(1 + 3 * (count - 1));
+    let base = available / count;
+    let mut widths = vec![base; count];
+    widths[count - 1] = available - base * (count - 1);
+    widths
+}
+
+/// 0-based columns (inside the panel) of the `│` between graph cells.
+fn graph_separator_columns(inner: usize, count: usize) -> Vec<usize> {
+    let mut x = 1;
+    let widths = graph_cell_widths(inner, count);
+    widths[..widths.len() - 1]
+        .iter()
+        .map(|w| {
+            x += w + 1;
+            let column = x - 1;
+            x += 2;
+            column
+        })
+        .collect()
+}
+
+/// Thin horizontal rule between two graph rows with T-junctions where the
+/// vertical separators meet it.
+fn push_graph_divider(
+    frame: &mut String,
+    above: usize,
+    below: usize,
+    inner: usize,
+    color: bool,
+    truecolor: bool,
+) {
+    let up = graph_separator_columns(inner, above);
+    let down = graph_separator_columns(inner, below);
+    let mut line = String::from("├");
+    for x in 0..inner {
+        line.push(match (up.contains(&x), down.contains(&x)) {
+            (true, true) => '┼',
+            (true, false) => '┴',
+            (false, true) => '┬',
+            _ => '─',
+        });
+    }
+    line.push('┤');
+    let _ = writeln!(frame, "{}", style(&line, BORDER, color, truecolor));
 }
 
 #[cfg(test)]
@@ -1671,7 +1710,7 @@ mod tests {
             super::push_gpu_panel(&mut frame, &snapshot.gpus[0], &history, 64, 1, false, Some(60000), color, true);
             for row in frame.lines() {
                 assert_eq!(visible_len_ansi(row), 64, "panel row exceeded its budget: {row:?}");
-                assert!(row.contains('│') || row.contains('╭') || row.contains('╰'));
+                assert!(row.contains('│') || row.contains('╭') || row.contains('╰') || row.contains('├'));
             }
             // The header's printable characters and controls occupy the same
             // columns whether color is enabled or disabled.

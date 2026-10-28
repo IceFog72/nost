@@ -52,7 +52,7 @@ fn demo_frames_fit_terminal_and_do_not_scroll_the_last_row() {
                     row.chars().count() < width,
                     "{width}x{height}, color={color}: row exceeds usable width: {row:?}"
                 );
-                assert!(row.ends_with('│') || row.ends_with('╮') || row.ends_with('╯'));
+                assert!(row.ends_with('│') || row.ends_with('╮') || row.ends_with('╯') || row.ends_with('┤'));
             }
         }
     }
