@@ -110,7 +110,7 @@ Unsupported optional metrics display as `--` instead of failing the monitor.
 ./run-demo.sh              # UI preview without an NVIDIA GPU
 ```
 
-Default refresh is 500 ms.
+Default refresh is 1000 ms.
 
 The JSON schema is versioned by its "schema" field; fields NVML cannot provide are null.
 

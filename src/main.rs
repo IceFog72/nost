@@ -78,7 +78,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            interval: Duration::from_millis(500),
+            interval: Duration::from_millis(1000),
             once: false,
             inline: false,
             demo: false,
@@ -308,7 +308,7 @@ fn print_help() {
     println!(
         "nost - minimal direct-NVML NVIDIA GPU monitor\n\n\
 Usage:\n  nost [options]\n\n\
-Options:\n  -i, --interval SECONDS  refresh interval (default: 0.5)\n\
+Options:\n  -i, --interval SECONDS  refresh interval (default: 1)\n\
       --once              render one frame and exit\n\
       --inline            use the normal terminal screen\n\
       --demo              animated UI without NVIDIA hardware\n\
