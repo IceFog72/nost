@@ -20,6 +20,18 @@ Runtime/build scripts:
 
 `build.sh` uses an existing Cargo/Rust installation when present. If Rust is missing, it bootstraps a **local** minimal stable toolchain under `.tools/` using the official rustup installer; it does not modify your shell profile. The build runs release-mode unit and CLI tests, compiles the binary, then performs a `--demo --once` smoke test.
 
+## What the screen shows
+
+- **GPU panel**: five history graphs separated by thin rules, each titled in the border line above it.
+  - First row: `gpu` utilization and `mem` (used / usable VRAM).
+  - Second row: `power` (draw as a share of the power limit), `temp` (closeness to the thermal limit) and `cap`.
+  - `cap` is a performance-cap reason bar in the style of GPU-Z: every sample is a full-height column in the colour of its main reason, and no limit stays blank. Reasons are shown as `Pwr`, `Thrm`, `VRel`, `Idle`, `Board`, plus `hw slowdown`, `power brake`, `sync`, `app clocks`, `display` and `other`.
+  - Below the graphs: core clock, memory clock and fan.
+- **processes**: per-process GPU% and VRAM, sorted by VRAM by default.
+- **vram holders**: processes holding `/dev/nvidia-uvm`, including ones NVML does not attribute.
+
+On very short terminals each graph collapses to one line and the secondary rows disappear; titles that do not fit in a border are drawn over the graph instead.
+
 ## Install as a CLI command + desktop app
 
 There are exactly two installation scripts:
@@ -87,9 +99,9 @@ For the real monitor:
 - power draw + power limit
 - fan speed
 - graphics and memory clocks
-- active clock-event / performance-limit reasons (power, thermal, hardware slowdown, idle, etc.)
-- NVENC encoder and NVDEC decoder utilization
-- PCIe TX/RX throughput
+- active clock-event / performance-limit reasons (power, thermal, hardware slowdown, reliability, board limit, idle, etc.)
+- NVENC encoder and NVDEC decoder utilization (in `--json`; not drawn on screen)
+- PCIe TX/RX throughput (in `--json`; not drawn on screen)
 - compute and graphics process PIDs
 - per-process framebuffer memory
 - per-process SM utilization when `nvmlDeviceGetProcessUtilization` is supported; sample timestamps are advanced between refreshes so old non-zero utilization is not held forever
@@ -106,7 +118,7 @@ Unsupported optional metrics display as `--` instead of failing the monitor.
 ./run.sh --inline          # render on the normal terminal screen
 ./run.sh --once            # one frame, then exit
 ./run.sh --no-color        # disable colors; screen-control escapes remain
-./run.sh --json           # print one snapshot as JSON and exit
+./run.sh --json            # print one snapshot as JSON and exit
 ./run-demo.sh              # UI preview without an NVIDIA GPU
 ```
 
@@ -114,7 +126,9 @@ Default refresh is 1000 ms.
 
 The JSON schema is versioned by its "schema" field; fields NVML cannot provide are null.
 
-While nost is running, press or left-click `-` or `+` to change the refresh interval by 100 ms. The current interval appears in the first GPU panel's top-right corner. The allowed range is 100 ms to 60 seconds. Hold Shift while dragging to select terminal text. Ctrl-Z suspends nost and restores the terminal; `fg` resumes the dashboard. Press `q` (or Ctrl-C) to quit. Left-click a column header in the processes table to sort by it; click again to reverse (▲ ascending, ▼ descending).
+While nost is running, press or left-click `-` or `+` to change the refresh interval by 100 ms. The current interval appears in the first GPU panel's top-right corner. The allowed range is 100 ms to 60 seconds. Hold Shift while dragging to select terminal text. Ctrl-Z suspends nost and restores the terminal; `fg` resumes the dashboard. Press `q` (or Ctrl-C) to quit. 
+
+Left-click a column header in the processes table to sort by it; the default is VRAM, largest first. Click the same header again to reverse the order. `▲` marks ascending and `▼` descending.
 
 ## Architecture
 
@@ -127,7 +141,7 @@ NVIDIA driver
       Rust NVML FFI loader
        ├── device metrics + thermal limits
        ├── clock-event reasons + video engines
-       ├── PCIe TX/RX traffic
+       ├── PCIe TX/RX traffic (background sampler thread)
        ├── running processes
        └── process utilization
              │
