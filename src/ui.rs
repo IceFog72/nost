@@ -615,41 +615,27 @@ fn push_gpu_panel(
     let interval_plain = interval_ms.map(|ms| format!("- {ms}ms +"));
     let title_prefix = format!("GPU {}  ", gpu.index);
     let right_width = interval_plain.as_ref().map_or(0, |value| value.chars().count() + 3);
-    let name = truncate(&gpu.name, width.saturating_sub(title_prefix.chars().count() + right_width + 5));
-    let title_plain = format!("{title_prefix}{name}");
-    let title_styled = if color {
-        format!(
-            "{BOLD}{}GPU {}{RESET}  {}{}{RESET}",
-            fg(ACCENT, truecolor),
-            gpu.index,
-            fg(TEXT, truecolor),
-            name
-        )
-    } else {
-        title_plain.clone()
-    };
-    let interval_styled = interval_ms.map(|ms| {
-        format!(
-            "{}-{RESET} {BOLD}{ms}ms{RESET} {}+{RESET}",
-            fg(BLUE, truecolor),
-            fg(BLUE, truecolor)
-        )
-    });
-    push_panel_top(
-        frame,
-        &title_plain,
-        &title_styled,
-        interval_plain.as_deref().zip(interval_styled.as_deref()),
-        width,
-        color,
-        truecolor,
-    );
-
     let inner = width.saturating_sub(2);
+    let mut name_budget = width.saturating_sub(title_prefix.chars().count() + right_width + 5);
+    // The title must also stop before the first vertical rule (border index
+    // sep + 1), leaving room for the " gpu NN% " title that hangs off it.
+    let first_rule = graph_separator_columns(inner, 2)[0] + 1;
+    let gpu_title_len = 3 + 1 + gpu.gpu_util.map_or(2, |v| v.to_string().len() + 1) + 2;
+    let before_rule = first_rule.saturating_sub(5 + title_prefix.chars().count());
+    let gpu_title_in_border = before_rule >= gpu_title_len + 10;
+    name_budget = name_budget.min(if gpu_title_in_border {
+        before_rule - gpu_title_len
+    } else {
+        before_rule
+    });
+    let name = truncate(&gpu.name, name_budget);
+    let title_len = title_prefix.chars().count() + name.chars().count();
 
     // Five history graphs: gpu + mem on the first row, power + thermal +
-    // performance-cap reason on the second. Current readings sit to the right
-    // of each graph. Under height pressure every graph collapses to one line.
+    // performance-cap reason on the second. Each graph's label and reading is
+    // written into the border line above it; if it does not fit there it is
+    // overlaid on the graph instead. Under height pressure every graph
+    // collapses to one line.
     let gpu_rgb = gpu.gpu_util.map_or(MUTED, |v| grade_rgb(v as f64, Grade::Heat));
     let gpu_text = gpu.gpu_util.map_or_else(|| "--".to_string(), |v| format!("{v}%"));
 
@@ -683,32 +669,62 @@ fn push_gpu_panel(
     let cap_readings = vec![(cap_text.to_string(), clock_limit_color(cap_text))];
 
     let hist = |pick: fn(&GpuHistory) -> &VecDeque<f64>| history.series(gpu.index, pick);
-    push_graph_row(
-        frame,
+    let top_cells = [
+        GraphCell { label: "gpu", values: hist(|h| &h.gpu), grade: Grade::Heat, readings: vec![(gpu_text, gpu_rgb)] },
+        GraphCell { label: "mem", values: hist(|h| &h.memory), grade: Grade::Memory, readings: mem_readings },
+    ];
+    let bottom_cells = [
+        GraphCell { label: "power", values: hist(|h| &h.power), grade: Grade::Heat, readings: power_readings },
+        GraphCell { label: "temp", values: hist(|h| &h.thermal), grade: Grade::Heat, readings: thermal_readings },
+        GraphCell { label: "cap", values: hist(|h| &h.cap), grade: Grade::Heat, readings: cap_readings },
+    ];
+
+    // Top border: GPU name on the left, refresh interval on the right, and the
+    // gpu/mem titles between them, hanging off the vertical rule.
+    let mut top = BorderLine::new(width, '╭', '╮');
+    top.put_titled(
+        2,
         &[
-            GraphCell { label: "gpu", values: hist(|h| &h.gpu), grade: Grade::Heat, readings: vec![(gpu_text, gpu_rgb)] },
-            GraphCell { label: "mem", values: hist(|h| &h.memory), grade: Grade::Memory, readings: mem_readings },
+            (format!("GPU {}", gpu.index), ACCENT, true),
+            ("  ".to_string(), TEXT, false),
+            (name.clone(), TEXT, false),
         ],
-        graph_rows,
-        inner,
-        color,
-        truecolor,
     );
-    if !ultra_compact {
-        push_graph_divider(frame, 2, 3, inner, color, truecolor);
+    if let Some(plain) = &interval_plain {
+        let len = plain.chars().count();
+        let (minus, rest) = plain.split_at(1);
+        let (middle, plus) = rest.split_at(rest.len() - 1);
+        top.put_titled(
+            width.saturating_sub(4 + len),
+            &[
+                (minus.to_string(), BLUE, false),
+                (middle.to_string(), TEXT, true),
+                (plus.to_string(), BLUE, false),
+            ],
+        );
     }
-    push_graph_row(
-        frame,
-        &[
-            GraphCell { label: "power", values: hist(|h| &h.power), grade: Grade::Heat, readings: power_readings },
-            GraphCell { label: "temp", values: hist(|h| &h.thermal), grade: Grade::Heat, readings: thermal_readings },
-            GraphCell { label: "cap", values: hist(|h| &h.cap), grade: Grade::Heat, readings: cap_readings },
-        ],
-        graph_rows,
-        inner,
-        color,
-        truecolor,
-    );
+    for column in graph_separator_columns(inner, top_cells.len()) {
+        top.junction(column + 1, '┬');
+    }
+    let top_in_border = top.place_cell_titles(&top_cells, inner, 5 + title_len, gpu_title_in_border);
+    frame.push_str(&top.render(color, truecolor));
+    push_graph_row(frame, &top_cells, &top_in_border, graph_rows, inner, color, truecolor);
+
+    let bottom_in_border = if ultra_compact {
+        vec![false; bottom_cells.len()]
+    } else {
+        let mut divider = BorderLine::new(width, '├', '┤');
+        for column in graph_separator_columns(inner, top_cells.len()) {
+            divider.junction(column + 1, '┴');
+        }
+        for column in graph_separator_columns(inner, bottom_cells.len()) {
+            divider.junction(column + 1, '┬');
+        }
+        let placed = divider.place_cell_titles(&bottom_cells, inner, 2, true);
+        frame.push_str(&divider.render(color, truecolor));
+        placed
+    };
+    push_graph_row(frame, &bottom_cells, &bottom_in_border, graph_rows, inner, color, truecolor);
 
     if !ultra_compact {
             let fan_plain = gpu
@@ -1289,10 +1305,12 @@ struct GraphCell<'a> {
 }
 
 /// Draw several history graphs side by side, sharing the panel width equally.
-/// Each cell has a text column (label and live readings) left of its graph.
+/// A cell whose `in_border` flag is false has its label and reading overlaid on
+/// the top-left corner of the graph (where the oldest samples are).
 fn push_graph_row(
     frame: &mut String,
     cells: &[GraphCell],
+    in_border: &[bool],
     rows: usize,
     inner: usize,
     color: bool,
@@ -1303,24 +1321,24 @@ fn push_graph_row(
     let separator = style(" │ ", BORDER, color, truecolor);
 
     let mut columns: Vec<Vec<String>> = Vec::with_capacity(cells.len());
-    for (cell, &cell_w) in cells.iter().zip(&widths) {
+    for ((cell, &cell_w), &titled) in cells.iter().zip(&widths).zip(in_border) {
         let mut grid = graph_cells(cell.values, cell_w, rows, cell.grade);
-        // Label and reading are drawn over the top-left corner of the graph,
-        // where the oldest samples are.
-        let max_text = cell_w.saturating_sub(cell_w / 3);
-        let mut x = 0;
-        let mut put = |text: &str, rgb: Rgb| {
-            for ch in truncate(text, max_text.saturating_sub(x)).chars() {
-                if x < grid[0].len() {
-                    grid[0][x] = (ch, rgb);
-                    x += 1;
+        if !titled {
+            let max_text = cell_w.saturating_sub(cell_w / 3);
+            let mut x = 0;
+            let mut put = |text: &str, rgb: Rgb| {
+                for ch in truncate(text, max_text.saturating_sub(x)).chars() {
+                    if x < grid[0].len() {
+                        grid[0][x] = (ch, rgb);
+                        x += 1;
+                    }
                 }
+            };
+            put(cell.label, MUTED);
+            put(" ", MUTED);
+            if let Some((text, rgb)) = cell.readings.first() {
+                put(text, *rgb);
             }
-        };
-        put(cell.label, MUTED);
-        put(" ", MUTED);
-        if let Some((text, rgb)) = cell.readings.first() {
-            put(text, *rgb);
         }
         columns.push(grid.iter().map(|row| cells_to_string(row, color, truecolor)).collect());
     }
@@ -1334,6 +1352,99 @@ fn push_graph_row(
             line.push_str(&column[row]);
         }
         push_panel_line(frame, &line, inner, color, truecolor);
+    }
+}
+
+/// A horizontal border (top edge or divider) built as a grid so titles and
+/// T-junctions can be written into it.
+struct BorderLine {
+    cells: Vec<(char, Rgb, bool)>,
+}
+
+impl BorderLine {
+    fn new(width: usize, left: char, right: char) -> Self {
+        let mut cells = vec![('─', BORDER, false); width.max(2)];
+        cells[0].0 = left;
+        let last = cells.len() - 1;
+        cells[last].0 = right;
+        Self { cells }
+    }
+
+    fn junction(&mut self, index: usize, ch: char) {
+        if index > 0 && index < self.cells.len() - 1 {
+            self.cells[index].0 = ch;
+        }
+    }
+
+    /// Write ` text ` (one space of padding each side) starting at `start`.
+    /// Fails, changing nothing, unless the whole span is still plain border.
+    fn put_titled(&mut self, start: usize, parts: &[(String, Rgb, bool)]) -> bool {
+        let len: usize = parts.iter().map(|(t, _, _)| t.chars().count()).sum::<usize>() + 2;
+        if start == 0 || start + len > self.cells.len() - 1 {
+            return false;
+        }
+        if self.cells[start..start + len].iter().any(|c| c.0 != '─') {
+            return false;
+        }
+        let mut x = start;
+        self.cells[x] = (' ', BORDER, false);
+        x += 1;
+        for (text, rgb, bold) in parts {
+            for ch in text.chars() {
+                self.cells[x] = (ch, *rgb, *bold);
+                x += 1;
+            }
+        }
+        self.cells[x] = (' ', BORDER, false);
+        true
+    }
+
+    /// Put each cell's `label reading` title just right of the junction that
+    /// starts the cell (cell 0 goes at `first_start`). Returns which fit.
+    fn place_cell_titles(
+        &mut self,
+        cells: &[GraphCell],
+        inner: usize,
+        first_start: usize,
+        first_enabled: bool,
+    ) -> Vec<bool> {
+        let separators = graph_separator_columns(inner, cells.len());
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, cell)| {
+                let start = if i == 0 { first_start } else { separators[i - 1] + 2 };
+                let mut parts = vec![(cell.label.to_string(), MUTED, false)];
+                if let Some((text, rgb)) = cell.readings.first() {
+                    parts.push((" ".to_string(), MUTED, false));
+                    parts.push((text.clone(), *rgb, false));
+                }
+                (i > 0 || first_enabled) && self.put_titled(start, &parts)
+            })
+            .collect()
+    }
+
+    fn render(&self, color: bool, truecolor: bool) -> String {
+        let mut line = String::with_capacity(self.cells.len() * 4 + 32);
+        let mut current: Option<((u8, u8, u8), bool)> = None;
+        for &(ch, rgb, bold) in &self.cells {
+            if color && current != Some(((rgb.0, rgb.1, rgb.2), bold)) {
+                if current.is_some() {
+                    line.push_str(RESET);
+                }
+                if bold {
+                    line.push_str(BOLD);
+                }
+                line.push_str(&fg(rgb, truecolor));
+                current = Some(((rgb.0, rgb.1, rgb.2), bold));
+            }
+            line.push(ch);
+        }
+        if color {
+            line.push_str(RESET);
+        }
+        line.push('\n');
+        line
     }
 }
 
@@ -1361,31 +1472,6 @@ fn graph_separator_columns(inner: usize, count: usize) -> Vec<usize> {
             column
         })
         .collect()
-}
-
-/// Thin horizontal rule between two graph rows with T-junctions where the
-/// vertical separators meet it.
-fn push_graph_divider(
-    frame: &mut String,
-    above: usize,
-    below: usize,
-    inner: usize,
-    color: bool,
-    truecolor: bool,
-) {
-    let up = graph_separator_columns(inner, above);
-    let down = graph_separator_columns(inner, below);
-    let mut line = String::from("├");
-    for x in 0..inner {
-        line.push(match (up.contains(&x), down.contains(&x)) {
-            (true, true) => '┼',
-            (true, false) => '┴',
-            (false, true) => '┬',
-            _ => '─',
-        });
-    }
-    line.push('┤');
-    let _ = writeln!(frame, "{}", style(&line, BORDER, color, truecolor));
 }
 
 #[cfg(test)]
@@ -1693,9 +1779,9 @@ mod tests {
         history.update(&snapshot);
         let mut frame = String::new();
         super::push_gpu_panel(&mut frame, &snapshot.gpus[0], &history, 100, 1, false, None, false, true);
-        let gpu_row = frame.lines().find(|row| row.contains(" gpu ")).expect("gpu graph row");
-        assert!(gpu_row.contains("--  "), "{gpu_row:?}");
-        assert!(!gpu_row.contains("0%  "), "{gpu_row:?}");
+        let gpu_row = frame.lines().find(|row| row.contains(" gpu ")).expect("gpu title");
+        assert!(gpu_row.contains("gpu --"), "{gpu_row:?}");
+        assert!(!gpu_row.contains("gpu 0%"), "{gpu_row:?}");
     }
 
     #[test]
