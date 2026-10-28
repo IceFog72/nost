@@ -116,10 +116,12 @@ fn process_header_hit(column: usize, inner: usize) -> Option<SortColumn> {
 #[derive(Clone, Copy)]
 struct Rgb(u8, u8, u8);
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Grade {
     Heat,
     Memory,
+    /// Samples are cap categories, drawn as full-height columns.
+    Reason,
 }
 
 pub const INPUT_MODES_OFF: &str = concat!(
@@ -386,7 +388,7 @@ impl History {
             push_bounded(&mut h.memory, gpu.memory_percent(), max_len);
             push_bounded(&mut h.power, power_percent(gpu), max_len);
             push_bounded(&mut h.thermal, temperature_grade(gpu), max_len);
-            push_bounded(&mut h.cap, gpu.clock_limit.as_deref().map_or(0.0, clock_limit_level), max_len);
+            push_bounded(&mut h.cap, gpu.clock_limit.as_deref().map_or(0.0, |limit| cap_category(limit) as f64), max_len);
         }
     }
 
@@ -676,7 +678,7 @@ fn push_gpu_panel(
     let bottom_cells = [
         GraphCell { label: "power", values: hist(|h| &h.power), grade: Grade::Heat, readings: power_readings },
         GraphCell { label: "temp", values: hist(|h| &h.thermal), grade: Grade::Heat, readings: thermal_readings },
-        GraphCell { label: "cap", values: hist(|h| &h.cap), grade: Grade::Heat, readings: cap_readings },
+        GraphCell { label: "cap", values: hist(|h| &h.cap), grade: Grade::Reason, readings: cap_readings },
     ];
 
     // Top border: GPU name on the left, refresh interval on the right, and the
@@ -767,38 +769,46 @@ fn power_percent(gpu: &GpuSnapshot) -> f64 {
     }
 }
 
-/// Severity of a clock-limit reason on the 0-100 heat scale: 0 when nothing
-/// holds the clocks back, higher for reasons that cost performance.
-fn clock_limit_level(limit: &str) -> f64 {
-    if limit == "--" || limit == "none" {
-        0.0
-    } else if limit == "idle" {
-        8.0
-    } else if limit.contains("thermal") || limit.contains("power brake") || limit.contains("hw slowdown") {
-        95.0
-    } else if limit.contains("power") {
-        78.0
-    } else {
-        62.0
+/// Category of the primary (most actionable) clock-limit reason. 0 means
+/// nothing limits the clocks. The cap graph stores one category per sample and
+/// gives each its own color, like GPU-Z's PerfCap Reason.
+fn cap_category(limit: &str) -> u8 {
+    match limit.split('+').next().unwrap_or("") {
+        "none" | "--" | "" => 0,
+        "idle" => 1,
+        "power" => 2,
+        "thermal" => 3,
+        "hw thermal" => 4,
+        "power brake" => 5,
+        "hw slowdown" => 6,
+        "sync" => 7,
+        "app clocks" => 8,
+        "display" => 9,
+        _ => 10,
+    }
+}
+
+fn cap_color(category: u8) -> Rgb {
+    match category {
+        0 => ACCENT,
+        1 => BLUE,
+        2 => Rgb(255, 168, 64),
+        3 => Rgb(255, 92, 72),
+        4 => Rgb(224, 48, 64),
+        5 => Rgb(214, 88, 214),
+        6 => Rgb(176, 64, 255),
+        7 => Rgb(150, 160, 255),
+        8 => CYAN,
+        9 => Rgb(96, 224, 190),
+        _ => MUTED,
     }
 }
 
 fn clock_limit_color(limit: &str) -> Rgb {
     if limit == "--" {
         MUTED
-    } else if limit == "none" {
-        ACCENT
-    } else if limit == "idle" {
-        BLUE
-    } else if limit.contains("thermal")
-        || limit.contains("power brake")
-        || limit.contains("hw slowdown")
-    {
-        grade_rgb(95.0, Grade::Heat)
-    } else if limit.contains("power") {
-        grade_rgb(78.0, Grade::Heat)
     } else {
-        grade_rgb(62.0, Grade::Heat)
+        cap_color(cap_category(limit))
     }
 }
 
@@ -1528,6 +1538,15 @@ fn graph_cells(
         None => vec![0.0; width],
     };
 
+    if grade == Grade::Reason {
+        // One full-height column per sample; category 0 (no limit) stays blank.
+        let column = |value: &f64| match *value as u8 {
+            0 => (' ', MUTED),
+            category => ('█', cap_color(category)),
+        };
+        return vec![visible.iter().map(column).collect(); rows];
+    }
+
     if rows == 1 {
         return vec![visible
             .iter()
@@ -1560,6 +1579,7 @@ fn graph_cells(
 fn grade_rgb(value: f64, grade: Grade) -> Rgb {
     let value = value.clamp(0.0, 100.0);
     match grade {
+        Grade::Reason => cap_color(value as u8),
         Grade::Heat => gradient(
             value,
             &[
@@ -1889,6 +1909,34 @@ mod tests {
             for &column in &super::graph_separator_columns(width - 2, 3) {
                 assert!(matches!(rows[divider][column + 1], '┬' | '┼'));
             }
+        }
+    }
+
+    #[test]
+    fn cap_reasons_get_distinct_colors_and_full_height_columns() {
+        use super::{cap_category, cap_color};
+        assert_eq!(cap_category("none"), 0);
+        assert_eq!(cap_category("power+thermal"), cap_category("power"));
+        let reasons = ["idle", "power", "thermal", "hw thermal", "power brake", "hw slowdown", "sync", "app clocks", "display", "other"];
+        let colors: Vec<(u8, u8, u8)> = reasons
+            .iter()
+            .map(|r| {
+                let c = cap_color(cap_category(r));
+                (c.0, c.1, c.2)
+            })
+            .collect();
+        for (i, a) in colors.iter().enumerate() {
+            assert!(colors[i + 1..].iter().all(|b| a != b), "{reasons:?}");
+        }
+
+        let values = VecDeque::from(vec![0.0, 2.0, 3.0]);
+        let rows = super::graph_cells(Some(&values), 3, 4, Grade::Reason);
+        assert_eq!(rows.len(), 4);
+        for row in &rows {
+            assert_eq!(row[0].0, ' ');
+            assert_eq!(row[1].0, '█');
+            assert_eq!(row[2].0, '█');
+            assert_ne!((row[1].1 .0, row[1].1 .1), (row[2].1 .0, row[2].1 .1));
         }
     }
 

@@ -47,7 +47,18 @@ impl DemoCollector {
             fan_percent: Some(wave(44.0, 12.0, 0.28, 1.0)),
             graphics_clock_mhz: Some((1665.0 + 240.0 * (t * 0.47).sin()) as u32),
             memory_clock_mhz: Some(7001),
-            clock_limit: Some(if gpu_util > 78 { "power" } else { "none" }.to_string()),
+            clock_limit: Some(
+                if gpu_util > 85 {
+                    "power+thermal"
+                } else if gpu_util > 78 {
+                    "power"
+                } else if gpu_util < 30 {
+                    "idle"
+                } else {
+                    "none"
+                }
+                .to_string(),
+            ),
             encoder_util_percent: Some(wave(18.0, 15.0, 0.51, 0.8)),
             decoder_util_percent: Some(wave(9.0, 8.0, 0.69, 2.1)),
             pcie_current_gen: Some(4),
