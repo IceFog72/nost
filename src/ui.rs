@@ -503,7 +503,7 @@ pub fn render(
     let gpu_panel_lines = if vertical_layout.ultra_compact {
         2usize + vertical_layout.graph_rows * 2
     } else {
-        4usize + vertical_layout.graph_rows * 2
+        3usize + vertical_layout.graph_rows * 2
     };
     let process_min_lines = if vertical_layout.ultra_compact { 5usize } else { 6usize };
     let holders_min_lines = if vertical_layout.show_holders {
@@ -749,20 +749,6 @@ fn push_gpu_panel(
             let memory_metric = metric("mem clock", &memory_clock_plain, TEXT, color, truecolor);
             push_panel_columns(frame, &[core_metric, memory_metric, fan_metric], inner, color, truecolor);
 
-            let video_metric = video_metric(
-                gpu.encoder_util_percent,
-                gpu.decoder_util_percent,
-                color,
-                truecolor,
-            );
-            let traffic_metric = traffic_metric(
-                gpu.pcie_tx_kb_per_s,
-                gpu.pcie_rx_kb_per_s,
-                color,
-                truecolor,
-            );
-            push_panel_columns(frame, &[video_metric, traffic_metric], inner, color, truecolor);
-
     }
 
     push_panel_bottom(frame, width, color, truecolor);
@@ -818,77 +804,6 @@ fn clock_limit_color(limit: &str) -> Rgb {
     } else {
         grade_rgb(62.0, Grade::Heat)
     }
-}
-
-fn video_metric(
-    encoder: Option<u32>,
-    decoder: Option<u32>,
-    color: bool,
-    truecolor: bool,
-) -> Metric {
-    let enc = encoder
-        .map(|v| format!("{v}%"))
-        .unwrap_or_else(|| "--".to_string());
-    let dec = decoder
-        .map(|v| format!("{v}%"))
-        .unwrap_or_else(|| "--".to_string());
-    let plain = format!("video  ENC {enc}  DEC {dec}");
-    let styled = if color {
-        let enc_color = encoder
-            .map(|v| grade_rgb(v as f64, Grade::Memory))
-            .unwrap_or(MUTED);
-        let dec_color = decoder
-            .map(|v| grade_rgb(v as f64, Grade::Memory))
-            .unwrap_or(MUTED);
-        format!(
-            "{}{label}{RESET}  {}ENC{RESET} {}{enc}{RESET}  {}DEC{RESET} {}{dec}{RESET}",
-            fg(MUTED, truecolor),
-            fg(MUTED, truecolor),
-            fg(enc_color, truecolor),
-            fg(MUTED, truecolor),
-            fg(dec_color, truecolor),
-            label = "video",
-        )
-    } else {
-        plain.clone()
-    };
-    Metric { plain, styled }
-}
-
-fn format_pcie_rate(kb_per_s: u32) -> String {
-    let value = kb_per_s as f64;
-    if value >= 1_000_000.0 {
-        format!("{:.1} GB/s", value / 1_000_000.0)
-    } else if value >= 1_000.0 {
-        format!("{:.0} MB/s", value / 1_000.0)
-    } else {
-        format!("{kb_per_s} KB/s")
-    }
-}
-
-fn traffic_metric(
-    tx: Option<u32>,
-    rx: Option<u32>,
-    color: bool,
-    truecolor: bool,
-) -> Metric {
-    let tx_value = tx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
-    let rx_value = rx.map(format_pcie_rate).unwrap_or_else(|| "--".to_string());
-    let plain = format!("traffic  TX {tx_value}  RX {rx_value}");
-    let styled = if color {
-        format!(
-            "{}{label}{RESET}  {}TX{RESET} {}{tx_value}{RESET}  {}RX{RESET} {}{rx_value}{RESET}",
-            fg(MUTED, truecolor),
-            fg(BLUE, truecolor),
-            fg(CYAN, truecolor),
-            fg(BLUE, truecolor),
-            fg(CYAN, truecolor),
-            label = "traffic",
-        )
-    } else {
-        plain.clone()
-    };
-    Metric { plain, styled }
 }
 
 #[derive(Clone)]
@@ -1740,7 +1655,7 @@ pub fn should_use_color(force_no_color: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_vertical_layout, format_memory_compact, format_memory_pretty, format_pcie_rate, grade_rgb,
+        choose_vertical_layout, format_memory_compact, format_memory_pretty, grade_rgb,
         history_graph_rows, parse_interval_input, process_header_hit, sort_processes, Input, ProcessSort, SortColumn, terminal_size_key, truncate,
         visible_len_ansi, Grade,
     };
@@ -1975,11 +1890,5 @@ mod tests {
         let cool = grade_rgb(10.0, Grade::Heat);
         let hot = grade_rgb(95.0, Grade::Heat);
         assert!(hot.0 > cool.0);
-    }
-
-    #[test]
-    fn pcie_rate_format_is_compact_and_explicit() {
-        assert_eq!(format_pcie_rate(185_000), "185 MB/s");
-        assert_eq!(format_pcie_rate(1_250_000), "1.2 GB/s");
     }
 }
