@@ -161,7 +161,10 @@ where
     F: FnMut() -> model::Snapshot,
 {
     let mut interval = config.interval;
-    let mut sort: Option<ui::ProcessSort> = None;
+    let mut sort = Some(ui::ProcessSort {
+        column: ui::SortColumn::Memory,
+        descending: true,
+    });
     while RUNNING.load(Ordering::Relaxed) {
         // Consume the resize wake-up that brought us here. A new SIGWINCH that
         // arrives during collection/rendering will set the flag again and keep
