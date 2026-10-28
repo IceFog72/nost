@@ -503,7 +503,7 @@ pub fn render(
     let gpu_panel_lines = if vertical_layout.ultra_compact {
         2usize + vertical_layout.graph_rows * 2
     } else {
-        5usize + vertical_layout.graph_rows * 2
+        4usize + vertical_layout.graph_rows * 2
     };
     let process_min_lines = if vertical_layout.ultra_compact { 5usize } else { 6usize };
     let holders_min_lines = if vertical_layout.show_holders {
@@ -731,36 +731,11 @@ fn push_gpu_panel(
     );
 
     if !ultra_compact {
-            let power_plain = match (gpu.power_mw, gpu.power_limit_mw) {
-                (Some(now), Some(limit)) => format!("{:.0}W / {:.0}W", now as f64 / 1000.0, limit as f64 / 1000.0),
-                (Some(now), None) => format!("{:.0}W", now as f64 / 1000.0),
-                _ => "--".to_string(),
-            };
-            let power_percent = match (gpu.power_mw, gpu.power_limit_mw) {
-                (Some(now), Some(limit)) if limit > 0 => now as f64 * 100.0 / limit as f64,
-                _ => 0.0,
-            };
-            let power_metric = metric(
-                "power",
-                &power_plain,
-                grade_rgb(power_percent, Grade::Heat),
-                color,
-                truecolor,
-            );
             let fan_plain = gpu
                 .fan_percent
                 .map(|v| format!("{v}%"))
                 .unwrap_or_else(|| "--".into());
             let fan_metric = metric("fan", &fan_plain, BLUE, color, truecolor);
-            let thermal_plain = format_temperature_thresholds(gpu);
-            let thermal_metric = metric(
-                "thermal",
-                &thermal_plain,
-                temperature_limit_color(gpu),
-                color,
-                truecolor,
-            );
-            push_panel_columns(frame, &[power_metric, fan_metric, thermal_metric], inner, color, truecolor);
 
             let core_plain = gpu
                 .graphics_clock_mhz
@@ -772,16 +747,7 @@ fn push_gpu_panel(
                 .unwrap_or_else(|| "--".into());
             let core_metric = metric("core clock", &core_plain, TEXT, color, truecolor);
             let memory_metric = metric("mem clock", &memory_clock_plain, TEXT, color, truecolor);
-            let limit_plain = gpu.clock_limit.as_deref().unwrap_or("--");
-            let limit_display = truncate(limit_plain, 12);
-            let limit_metric = metric(
-                "limit",
-                &limit_display,
-                clock_limit_color(limit_plain),
-                color,
-                truecolor,
-            );
-            push_panel_columns(frame, &[core_metric, memory_metric, limit_metric], inner, color, truecolor);
+            push_panel_columns(frame, &[core_metric, memory_metric, fan_metric], inner, color, truecolor);
 
             let video_metric = video_metric(
                 gpu.encoder_util_percent,
@@ -810,14 +776,6 @@ fn temperature_grade(gpu: &GpuSnapshot) -> f64 {
     let floor = 30u32.min(limit.saturating_sub(1));
     let span = limit.saturating_sub(floor).max(1) as f64;
     ((current.saturating_sub(floor) as f64 / span) * 100.0).clamp(0.0, 100.0)
-}
-
-fn temperature_limit_color(gpu: &GpuSnapshot) -> Rgb {
-    if gpu.temperature_limit_c().is_some() {
-        grade_rgb(72.0, Grade::Heat)
-    } else {
-        MUTED
-    }
 }
 
 fn power_percent(gpu: &GpuSnapshot) -> f64 {
@@ -895,18 +853,6 @@ fn video_metric(
         plain.clone()
     };
     Metric { plain, styled }
-}
-
-fn format_temperature_thresholds(gpu: &GpuSnapshot) -> String {
-    let operating = gpu
-        .temperature_max_operating_c
-        .or(gpu.temperature_slowdown_c);
-    match (operating, gpu.temperature_shutdown_c) {
-        (Some(limit), Some(shutdown)) if limit != shutdown => format!("{limit}/{shutdown}°C"),
-        (Some(limit), _) => format!("{limit}°C"),
-        (None, Some(shutdown)) => format!("--/{shutdown}°C"),
-        (None, None) => "--".to_string(),
-    }
 }
 
 fn format_pcie_rate(kb_per_s: u32) -> String {
